@@ -4,6 +4,8 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 use aes::cipher::{BlockEncrypt, KeyInit};
+use std::process::{Command, Stdio, Child};
+use std::io::Write;
 
 use crate::codec::SessionInfo;
 
@@ -111,6 +113,34 @@ pub async fn start_mirroring_server(port: u16, session_info: Arc<RwLock<Option<S
     }
 }
 
+/// Helper function to spawn a low-latency GStreamer pipeline process.
+fn spawn_gstreamer() -> Option<Child> {
+    info!("Spawning GStreamer low-latency video window (gst-launch-1.0)...");
+    let child = Command::new("gst-launch-1.0")
+        .args(&[
+            "fdsrc", "fd=0",
+            "!", "h264parse",
+            "!", "decodebin",
+            "!", "videoconvert",
+            "!", "autovideosink", "sync=false",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    match child {
+        Ok(c) => {
+            info!("GStreamer window spawned successfully");
+            Some(c)
+        }
+        Err(e) => {
+            warn!("Failed to spawn GStreamer process (gst-launch-1.0). Is it installed? Error: {:?}", e);
+            None
+        }
+    }
+}
+
 /// Handle a single mirroring TCP stream session.
 async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLock<Option<SessionInfo>>>) -> Result<()> {
     // 1. Wait/Poll for derived video keys to be populated in session_info
@@ -148,6 +178,21 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
             anyhow::bail!("Failed to initialize mirroring decryptor: no video keys available in session_info");
         }
     };
+
+    struct GstreamerGuard {
+        child: Option<Child>,
+    }
+
+    impl Drop for GstreamerGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                info!("Stopping GStreamer low-latency video window...");
+                let _ = child.kill();
+            }
+        }
+    }
+
+    let mut guard = GstreamerGuard { child: None };
 
     let mut header = [0u8; 128];
     loop {
@@ -214,6 +259,21 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                         nal_units = ?nal_units,
                         "Received video frame (decrypted & Annex-B formatted)"
                     );
+
+                    // Lazy-init GStreamer low-latency display window on first decrypted video frame
+                    if guard.child.is_none() {
+                        guard.child = spawn_gstreamer();
+                    }
+
+                    if let Some(ref mut child) = guard.child {
+                        if let Some(ref mut stdin) = child.stdin {
+                            if let Err(e) = stdin.write_all(&payload) {
+                                warn!("Failed to write video payload to GStreamer: {:?}", e);
+                            } else {
+                                let _ = stdin.flush();
+                            }
+                        }
+                    }
                 } else {
                     warn!(
                         payload_size = payload_size,
