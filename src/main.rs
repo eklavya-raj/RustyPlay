@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{info, Level};
+use tracing::info;
 use std::env;
 
 mod audio;
@@ -29,6 +29,7 @@ struct Config {
     rtp_port: u16,
     control_port: u16,
     timing_port: u16,
+    verbose: bool,
 }
 
 impl Default for Config {
@@ -39,6 +40,7 @@ impl Default for Config {
             rtp_port: DEFAULT_RTP_PORT,
             control_port: DEFAULT_CONTROL_PORT,
             timing_port: DEFAULT_TIMING_PORT,
+            verbose: false,
         }
     }
 }
@@ -99,8 +101,11 @@ fn parse_args() -> Config {
                     i += 1;
                 }
             }
+            "-v" | "--verbose" => {
+                config.verbose = true;
+            }
             "-h" | "--help" => {
-                println!("Usage: ux-play-rust [OPTIONS]");
+                println!("Usage: rusty-play [OPTIONS]");
                 println!();
                 println!("Options:");
                 println!("  -p, --port <PORT>           Set both HTTP and RTSP port (default: 7000/5000)");
@@ -109,7 +114,8 @@ fn parse_args() -> Config {
                 println!("      --rtp-port <PORT>       Set RTP port (default: 6000)");
                 println!("      --control-port <PORT>   Set control port (default: 6001)");
                 println!("      --timing-port <PORT>    Set timing port (default: 6002)");
-                println!("  -h, --help                   Print this help");
+                println!("  -v, --verbose               Enable logging");
+                println!("  -h, --help                  Print this help");
                 std::process::exit(0);
             }
             _ => {
@@ -128,13 +134,19 @@ fn parse_args() -> Config {
 async fn main() -> Result<()> {
     let config = parse_args();
 
+    let level_filter = if config.verbose {
+        tracing_subscriber::filter::LevelFilter::INFO
+    } else {
+        tracing_subscriber::filter::LevelFilter::OFF
+    };
+
     tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
+        .with_max_level(level_filter)
         .with_target(false)
         .with_thread_ids(true)
         .init();
 
-    info!("Starting ux-play-rust AirPlay Receiver");
+    info!("Starting RustyPlay AirPlay Receiver");
     info!("  HTTP (AirPlay control):  port {}", config.http_port);
     info!("  RTSP (RAOP audio):       port {}", config.rtsp_port);
     info!("  RTP  (audio data):       port {}", config.rtp_port);
