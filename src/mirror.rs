@@ -298,6 +298,44 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                     payload_size = payload_size,
                     "Received video codec config / resolution change"
                 );
+
+                if payload_size > 0 {
+                    // Convert AVCC length prefixes to Annex-B start codes ([0, 0, 0, 1]) for SPS/PPS
+                    let mut offset = 0;
+                    let mut is_valid = true;
+                    while offset < payload_size {
+                        if offset + 4 > payload_size {
+                            is_valid = false;
+                            break;
+                        }
+                        let nalu_len = u32::from_be_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
+                        if offset + 4 + nalu_len > payload_size {
+                            is_valid = false;
+                            break;
+                        }
+                        payload[offset..offset+4].copy_from_slice(&[0, 0, 0, 1]);
+                        offset += 4 + nalu_len;
+                    }
+
+                    if is_valid {
+                        // Lazy-init GStreamer low-latency display window on codec configuration
+                        if guard.child.is_none() {
+                            guard.child = spawn_gstreamer();
+                        }
+
+                        if let Some(ref mut child) = guard.child {
+                            if let Some(ref mut stdin) = child.stdin {
+                                if let Err(e) = stdin.write_all(&payload) {
+                                    warn!("Failed to write SPS/PPS headers to GStreamer: {:?}", e);
+                                } else {
+                                    let _ = stdin.flush();
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("Received malformed SPS/PPS configuration packet");
+                    }
+                }
             }
 
             0x02 => {
