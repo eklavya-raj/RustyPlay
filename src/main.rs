@@ -11,6 +11,7 @@ mod ntp;
 mod rtp;
 mod rtsp;
 mod mirror;
+mod video;
 
 use codec::SessionInfo;
 use ntp::ClockSync;
@@ -30,6 +31,8 @@ struct Config {
     control_port: u16,
     timing_port: u16,
     verbose: bool,
+    force_sw_dec: bool,
+    videosink: Option<String>,
 }
 
 impl Default for Config {
@@ -41,6 +44,8 @@ impl Default for Config {
             control_port: DEFAULT_CONTROL_PORT,
             timing_port: DEFAULT_TIMING_PORT,
             verbose: false,
+            force_sw_dec: false,
+            videosink: None,
         }
     }
 }
@@ -104,6 +109,15 @@ fn parse_args() -> Config {
             "-v" | "--verbose" => {
                 config.verbose = true;
             }
+            "-avdec" | "--software-decoding" => {
+                config.force_sw_dec = true;
+            }
+            "-vs" | "--video-sink" => {
+                if i + 1 < args.len() {
+                    config.videosink = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
             "-h" | "--help" => {
                 println!("Usage: rusty-play [OPTIONS]");
                 println!();
@@ -115,6 +129,8 @@ fn parse_args() -> Config {
                 println!("      --control-port <PORT>   Set control port (default: 6001)");
                 println!("      --timing-port <PORT>    Set timing port (default: 6002)");
                 println!("  -v, --verbose               Enable logging");
+                println!("  -avdec, --software-decoding Force software h264 video decoding with libav decoder (avdec_h264)");
+                println!("  -vs, --video-sink <SINK>    Set custom video sink (e.g. osximagesink, autovideosink)");
                 println!("  -h, --help                  Print this help");
                 std::process::exit(0);
             }
@@ -133,6 +149,13 @@ fn parse_args() -> Config {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = parse_args();
+
+    if config.force_sw_dec {
+        mirror::FORCE_SOFTWARE_DECODER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(ref sink) = config.videosink {
+        *mirror::CUSTOM_VIDEOSINK.lock().unwrap() = Some(sink.clone());
+    }
 
     let level_filter = if config.verbose {
         tracing_subscriber::filter::LevelFilter::INFO
