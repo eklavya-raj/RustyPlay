@@ -1,0 +1,13 @@
+/target
+
+# Ignore IDE / Tooling folders
+.windsurf/
+.gemini/
+.kiro/
+
+# Ignore reference C++ project
+uxplay/
+
+# Ignore all markdown files except README.md
+*.md
+!README.md

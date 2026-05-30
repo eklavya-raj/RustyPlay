@@ -1,0 +1,42 @@
+[package]
+name = "rusty-play"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+symphonia = { version = "0.5", features = ["aac", "alac"] }
+cpal = "0.15"
+httparse = "1.9"
+aes = "0.8"
+cbc = "0.1"
+ctr = "0.9"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+base64 = "0.22"
+ringbuf = "0.4"
+bytes = "1.7"
+socket2 = "0.5"
+plist = "1.6"
+x25519-dalek = "2.0"
+rand = "0.8"
+
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bonjour-sys = "0.1"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libmdns = "0.8"
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+proptest = "1.4"
