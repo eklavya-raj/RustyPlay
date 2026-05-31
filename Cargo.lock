@@ -1415,6 +1415,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "obs-airplay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusty-play",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1807,6 +1818,7 @@ dependencies = [
  "cocoa 0.25.0",
  "core-foundation 0.10.1",
  "core-video-sys",
+ "coreaudio-rs",
  "cpal",
  "ctr",
  "dispatch",

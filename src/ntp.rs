@@ -1,8 +1,26 @@
 use anyhow::Result;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
+
+/// RTSP `Audio-Latency` for AirPlay-class receivers: 11025 samples @ 44.1 kHz ≈ 250 ms.
+pub const AUDIO_LATENCY_SAMPLES: u32 = 11025;
+
+/// Reject NTP samples whose implied offset is nonsensical (e.g. t1 still zero).
+const MAX_ABS_OFFSET_MICROS: i64 = 50_000_000; // 50 seconds
+
+/// iPhone timing fields use a different epoch than our NTP transmit (~1.78e15 µs below).
+const TIMING_EPOCH_GAP_US: i64 = 500_000_000_000_000;
+
+/// Map iPhone receive/send timestamps into the same era as our NTP `t1`/`t4`.
+fn normalize_peer_timing_us(local_us: i64, peer_us: i64) -> i64 {
+    if local_us > peer_us && (local_us - peer_us) > TIMING_EPOCH_GAP_US {
+        peer_us + (local_us - peer_us)
+    } else {
+        peer_us
+    }
+}
 
 /// AirPlay timing packet header byte (request = 0x52, response = 0x53)
 const TIMING_REQUEST: u8 = 0x52;  // payload type 82
@@ -75,8 +93,12 @@ pub struct ClockSync {
     rtp_clock_rate: u32,
     /// Reference RTP timestamp (from RECORD RTP-Info header)
     rtp_reference: u32,
-    /// Server monotonic time corresponding to rtp_reference
+    /// Server monotonic time when `rtp_reference` should be presented to the listener
     reference_time: Option<Instant>,
+    /// Negotiated receiver latency in RTP sample units (default 11025)
+    audio_latency_samples: u32,
+    /// RTP control SYNC packets applied (refines anchor)
+    sync_count: u32,
 }
 
 impl ClockSync {
@@ -89,6 +111,8 @@ impl ClockSync {
             rtp_clock_rate,
             rtp_reference: 0,
             reference_time: None,
+            audio_latency_samples: AUDIO_LATENCY_SAMPLES,
+            sync_count: 0,
         }
     }
 
@@ -105,12 +129,25 @@ impl ClockSync {
     ///   t4 = client receive time (when we get the response)
     pub fn update(&mut self, client_send: NtpTimestamp, server_recv: NtpTimestamp, server_send: NtpTimestamp, client_recv: NtpTimestamp) {
         let t1 = client_send.to_micros();
-        let t2 = server_recv.to_micros();
-        let t3 = server_send.to_micros();
+        let t2 = normalize_peer_timing_us(t1, server_recv.to_micros());
+        let t3 = normalize_peer_timing_us(t1, server_send.to_micros());
         let t4 = client_recv.to_micros();
 
         let offset = ((t2 - t1) + (t3 - t4)) / 2;
         let rtt = (t4 - t1) - (t3 - t2);
+
+        if t1 == 0 || offset.abs() > MAX_ABS_OFFSET_MICROS || rtt < 0 || rtt > MAX_ABS_OFFSET_MICROS {
+            debug!(
+                t1_us = t1,
+                t2_us = t2,
+                t3_us = t3,
+                t4_us = t4,
+                offset_us = offset,
+                rtt_us = rtt,
+                "Rejecting invalid NTP timing sample"
+            );
+            return;
+        }
 
         // Apply exponential smoothing for stability
         if self.sample_count == 0 {
@@ -143,11 +180,65 @@ impl ClockSync {
         self.rtt_micros
     }
 
-    /// Set the RTP reference timestamp (from RECORD's RTP-Info header)
+    /// Receiver playout delay as wall-clock duration.
+    pub fn playout_latency(&self) -> Duration {
+        Duration::from_micros(
+            (self.audio_latency_samples as u64 * 1_000_000) / self.rtp_clock_rate as u64,
+        )
+    }
+
+    /// Set the RTP anchor from RECORD `RTP-Info` (playout starts after negotiated latency).
     pub fn set_rtp_reference(&mut self, rtp_ts: u32) {
         self.rtp_reference = rtp_ts;
+        self.reference_time = Some(Instant::now() + self.playout_latency());
+        info!(
+            rtp_reference = rtp_ts,
+            latency_ms = self.playout_latency().as_millis(),
+            "RTP reference timestamp set (RECORD)"
+        );
+    }
+
+    /// Update the playout anchor from an RTP control SYNC packet (Airtunes2 / shairport-sync).
+    ///
+    /// `rtp_now_minus_latency` is the RTP timestamp playing at the receiver *now*;
+    /// `rtp_now` is the sender's next transmit timestamp.
+    pub fn apply_sync_packet(
+        &mut self,
+        rtp_now_minus_latency: u32,
+        rtp_now: u32,
+        _remote_ntp: NtpTimestamp,
+        first_after_flush: bool,
+    ) {
+        let computed = rtp_now.wrapping_sub(self.audio_latency_samples);
+        let anchor_rtp = if rtp_now_minus_latency != 0 {
+            rtp_now_minus_latency
+        } else {
+            computed
+        };
+
+        self.rtp_reference = anchor_rtp;
         self.reference_time = Some(Instant::now());
-        info!(rtp_reference = rtp_ts, "RTP reference timestamp set");
+        self.sync_count += 1;
+
+        info!(
+            anchor_rtp = anchor_rtp,
+            rtp_now = rtp_now,
+            first_after_flush = first_after_flush,
+            sync_count = self.sync_count,
+            "RTP playout anchor updated from SYNC"
+        );
+    }
+
+    /// Clear anchor after RTSP FLUSH / RECORD (wait for next SYNC or RECORD).
+    pub fn reset_playout_anchor(&mut self) {
+        self.reference_time = None;
+        self.rtp_reference = 0;
+        debug!("RTP playout anchor cleared");
+    }
+
+    /// Number of SYNC packets processed.
+    pub fn sync_count(&self) -> u32 {
+        self.sync_count
     }
 
     /// Convert an RTP timestamp to a playout Instant on the server.
@@ -156,16 +247,24 @@ impl ClockSync {
     pub fn rtp_to_playout_time(&self, rtp_ts: u32) -> Option<Instant> {
         let ref_time = self.reference_time?;
 
-        // Handle wrapping subtraction for RTP timestamps
+        // Handle u32 wrap; timestamps far behind reference play immediately.
         let elapsed_samples = rtp_ts.wrapping_sub(self.rtp_reference);
-        let elapsed_micros = (elapsed_samples as u64 * 1_000_000) / self.rtp_clock_rate as u64;
+        if elapsed_samples > (1u32 << 31) {
+            return Some(ref_time);
+        }
 
+        let elapsed_micros = (elapsed_samples as u64 * 1_000_000) / self.rtp_clock_rate as u64;
         Some(ref_time + std::time::Duration::from_micros(elapsed_micros))
     }
 
     /// Check if clock sync is established
     pub fn is_synced(&self) -> bool {
         self.sample_count >= 1
+    }
+
+    /// True after RECORD provides an RTP-Info anchor (enables RTP playout scheduling).
+    pub fn has_rtp_anchor(&self) -> bool {
+        self.reference_time.is_some()
     }
 }
 
@@ -273,14 +372,19 @@ pub async fn start_timing_server(
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     info!(port = port, "NTP timing server started");
 
+    // t1 from our last active timing request (must match what the client echoes in response.reference)
+    let pending_active_send: Arc<Mutex<Option<NtpTimestamp>>> = Arc::new(Mutex::new(None));
+    let pending_active_send_loop = pending_active_send.clone();
+    // Chained timing state shared between active sender and response handler
+    let timing_chain: Arc<Mutex<(NtpTimestamp, NtpTimestamp)>> =
+        Arc::new(Mutex::new((NtpTimestamp::default(), NtpTimestamp::default())));
+    let timing_chain_loop = timing_chain.clone();
+    let timing_chain_recv = timing_chain.clone();
+
     // Spawn an active synchronization loop that polls the client every 3 seconds
     let socket_send = socket.clone();
     let client_addr_send = client_timing_addr.clone();
     tokio::spawn(async move {
-        // Keep track of the last client reference times to echo back in subsequent requests
-        let last_client_ref = NtpTimestamp::default();
-        let last_local_recv = NtpTimestamp::default();
-
         loop {
             let target_addr = {
                 let guard = client_addr_send.lock().unwrap();
@@ -288,16 +392,18 @@ pub async fn start_timing_server(
             };
 
             if let Some(addr) = target_addr {
+                let (last_origin, last_remote_recv) = *timing_chain_loop.lock().unwrap();
                 let now = NtpTimestamp::now();
                 let request = TimingPacket::build_request(
-                    last_client_ref,
-                    last_local_recv,
+                    last_origin,
+                    last_remote_recv,
                     now,
                 );
 
                 if let Err(e) = socket_send.send_to(&request, addr).await {
                     warn!("Failed to send active timing request to {}: {}", addr, e);
                 } else {
+                    *pending_active_send_loop.lock().unwrap() = Some(now);
                     debug!("Sent active timing request to {}", addr);
                 }
             }
@@ -334,34 +440,32 @@ pub async fn start_timing_server(
                             warn!("Failed to send timing response: {}", e);
                         }
 
-                        // Update our clock sync with the exchange
-                        if let Ok(mut sync) = clock_sync.write() {
-                            sync.update(
-                                request.send_time,  // t1: client send
-                                receive_time,       // t2: server receive
-                                send_time,          // t3: server send
-                                NtpTimestamp::now(), // t4: ~now (we just sent)
-                            );
-                        }
+                        // Do not call ClockSync::update here — t4 (when the client receives
+                        // our response) is unknown on the server. Only complete active
+                        // exchanges (our request → client TIMING_RESPONSE) update offset.
+                        *timing_chain_recv.lock().unwrap() =
+                            (request.send_time, request.receive_time);
 
-                        debug!(peer = %src, "Timing exchange completed (passive)");
+                        debug!(peer = %src, "Timing request answered (passive)");
                     } else {
                         debug!(bytes = amt, "Failed to parse timing request packet");
                     }
                 } else if payload_type == TIMING_RESPONSE {
                     if let Some(response) = TimingPacket::parse(&buf[..amt]) {
-                        let t0 = response.reference_time; // our t0 (which we sent in request[24..32], echoed back by client)
-                        let t1 = response.receive_time;   // client receive time
-                        let t2 = response.send_time;      // client send time
-                        let t3 = NtpTimestamp::now();     // our receive time
+                        // NTP: t1=our transmit, t2=client receive, t3=client transmit, t4=our receive
+                        let t1 = pending_active_send
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap_or(response.reference_time);
+                        let t2 = response.receive_time;
+                        let t3 = response.send_time;
+                        let t4 = NtpTimestamp::now();
+
+                        *timing_chain_recv.lock().unwrap() = (t3, t2);
 
                         if let Ok(mut sync) = clock_sync.write() {
-                            sync.update(t0, t1, t2, t3);
-                            info!(
-                                offset_us = sync.offset_micros,
-                                rtt_us = sync.rtt_micros,
-                                "Active clock sync established with iPhone!"
-                            );
+                            sync.update(t1, t2, t3, t4);
                         }
                     } else {
                         debug!(bytes = amt, "Failed to parse timing response packet");
@@ -415,6 +519,26 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_peer_timing_us() {
+        let local = 3_989_225_826_092_610_i64;
+        let peer = 2_209_104_133_858_832_i64;
+        let norm = normalize_peer_timing_us(local, peer);
+        assert!((norm - local).abs() < 10_000);
+    }
+
+    #[test]
+    fn test_clock_sync_rejects_zero_origin() {
+        let mut sync = ClockSync::new(44100);
+        sync.update(
+            NtpTimestamp::default(),
+            NtpTimestamp { seconds: 100, fraction: 0 },
+            NtpTimestamp { seconds: 100, fraction: 0 },
+            NtpTimestamp { seconds: 100, fraction: 0 },
+        );
+        assert!(!sync.is_synced());
+    }
+
+    #[test]
     fn test_rtp_to_playout_time() {
         let mut sync = ClockSync::new(44100);
         sync.set_rtp_reference(0);
@@ -425,6 +549,40 @@ mod tests {
         let elapsed = playout.duration_since(ref_time);
         // Should be approximately 1 second
         assert!((elapsed.as_millis() as i64 - 1000).abs() < 5);
+    }
+
+    #[test]
+    fn test_rtp_to_playout_time_behind_reference() {
+        let mut sync = ClockSync::new(44100);
+        sync.set_rtp_reference(10_000);
+        let ref_time = sync.reference_time.unwrap();
+        // Timestamp before reference must not schedule far in the future.
+        let playout = sync.rtp_to_playout_time(9_000).unwrap();
+        assert_eq!(playout, ref_time);
+    }
+
+    #[test]
+    fn test_apply_sync_packet_anchor() {
+        let mut sync = ClockSync::new(44100);
+        let now_rtp = 50_000u32;
+        let minus_lat = now_rtp.wrapping_sub(AUDIO_LATENCY_SAMPLES);
+        sync.apply_sync_packet(minus_lat, now_rtp, NtpTimestamp::default(), true);
+        assert_eq!(sync.rtp_reference, minus_lat);
+        assert_eq!(sync.sync_count(), 1);
+        let playout_now = sync.rtp_to_playout_time(minus_lat).unwrap();
+        let playout_future = sync.rtp_to_playout_time(now_rtp).unwrap();
+        assert!(playout_future > playout_now);
+        let delta = playout_future.duration_since(playout_now);
+        assert!((delta.as_millis() as i64 - 250).abs() < 5);
+    }
+
+    #[test]
+    fn test_record_anchor_includes_latency() {
+        let mut sync = ClockSync::new(44100);
+        let before = Instant::now();
+        sync.set_rtp_reference(0);
+        let ref_time = sync.reference_time.unwrap();
+        assert!(ref_time >= before + sync.playout_latency() - Duration::from_millis(5));
     }
 
     #[test]

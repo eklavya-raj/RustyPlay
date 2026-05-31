@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use crate::codec::{self, SessionInfo};
+use crate::ntp::ClockSync;
 use crate::rtp::JitterBuffer;
 
 unsafe extern "C" {
@@ -80,6 +81,7 @@ pub struct RtspState {
     pub client_timing_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
     pub fairplay_msg: Arc<Mutex<Option<Vec<u8>>>>,
     pub ecdh_secret: Arc<Mutex<Option<[u8; 32]>>>,
+    pub clock_sync: Arc<RwLock<ClockSync>>,
 }
 
 /// Helper function to build DNS-SD TXT record bytes from key=value pairs.
@@ -407,8 +409,8 @@ async fn handle_rtsp_request(request_bytes: &[u8], state: &Arc<RtspState>, peer:
                 disp.insert("widthPixels".to_string(), plist::Value::Integer(1920.into()));
                 disp.insert("heightPixels".to_string(), plist::Value::Integer(1080.into()));
                 disp.insert("rotation".to_string(), plist::Value::Boolean(false));
-                disp.insert("refreshRate".to_string(), plist::Value::Real(1.0 / 60.0));
-                disp.insert("maxFPS".to_string(), plist::Value::Integer(30.into()));
+                disp.insert("refreshRate".to_string(), plist::Value::Real(60.0));
+                disp.insert("maxFPS".to_string(), plist::Value::Integer(60.into()));
                 disp.insert("overscanned".to_string(), plist::Value::Boolean(false));
                 disp.insert("features".to_string(), plist::Value::Integer(14.into()));
                 displays.push(plist::Value::Dictionary(disp));
@@ -1003,12 +1005,21 @@ async fn handle_rtsp_request(request_bytes: &[u8], state: &Arc<RtspState>, peer:
                     if !rtp_info.is_empty() {
                         info!(rtp_info = rtp_info, "RTP-Info from RECORD");
                         // Parse "seq=XXXX;rtptime=YYYY"
-                        for part in rtp_info.split(';') {
+                        for part in rtp_info.split(|c| c == ';' || c == ' ') {
                             let part = part.trim();
-                            if let Some(seq_str) = part.strip_prefix("seq=")
-                                && let Ok(seq) = seq_str.parse::<u16>() {
+                            if let Some(seq_str) = part.strip_prefix("seq=") {
+                                if let Ok(seq) = seq_str.parse::<u16>() {
                                     info!(initial_seq = seq, "Initial RTP sequence number");
                                 }
+                            }
+                            if let Some(rtp_str) = part.strip_prefix("rtptime=") {
+                                if let Ok(rtp_ts) = rtp_str.parse::<u32>() {
+                                    if let Ok(mut sync) = state.clock_sync.write() {
+                                        sync.set_rtp_reference(rtp_ts);
+                                    }
+                                    info!(rtp_reference = rtp_ts, "RTP reference timestamp from RECORD");
+                                }
+                            }
                         }
                     }
 
@@ -1043,7 +1054,22 @@ async fn handle_rtsp_request(request_bytes: &[u8], state: &Arc<RtspState>, peer:
                     info!("TEARDOWN received — ending session");
                     {
                         let mut buffer = state.jitter_buffer.lock().unwrap();
+                        let (recv, dropped, dups) = buffer.stats();
                         buffer.flush();
+                        let (offset_us, rtt_us, synced) = state
+                            .clock_sync
+                            .read()
+                            .map(|s| (s.offset(), s.rtt(), s.is_synced()))
+                            .unwrap_or((0, 0, false));
+                        info!(
+                            jitter_received = recv,
+                            jitter_dropped = dropped,
+                            jitter_duplicates = dups,
+                            clock_synced = synced,
+                            clock_offset_us = offset_us,
+                            clock_rtt_us = rtt_us,
+                            "Session summary at TEARDOWN"
+                        );
                     }
                     // NOTE: Do NOT clear session info on TEARDOWN
                     // In AirPlay 2 screen mirroring, the iPhone sends encryption keys in an initial
@@ -1297,6 +1323,7 @@ mod tests {
             client_timing_addr: Arc::new(Mutex::new(None)),
             fairplay_msg: Arc::new(Mutex::new(None)),
             ecdh_secret: Arc::new(Mutex::new(None)),
+            clock_sync: Arc::new(RwLock::new(ClockSync::new(44100))),
         });
 
         // Initialize SessionInfo with Alac

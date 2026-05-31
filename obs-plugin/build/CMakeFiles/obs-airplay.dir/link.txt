@@ -1,0 +1,1 @@
+/usr/bin/cc  -arch arm64 -bundle -Wl,-headerpad_max_install_names -o obs-plugins/64bit/obs-airplay.so "CMakeFiles/obs-airplay.dir/src/obs-airplay-minimal.c.o" -F/Applications/OBS.app/Contents/Frameworks  -Wl,-rpath,/Applications/OBS.app/Contents/Frameworks -framework libobs

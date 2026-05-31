@@ -218,7 +218,7 @@ async fn async_main() -> Result<()> {
     info!("  NTP  (timing):           port {}", config.timing_port);
 
     // Shared state
-    let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(100)));
+    let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(64)));
     let session_info: Arc<RwLock<Option<SessionInfo>>> = Arc::new(RwLock::new(None));
     let clock_sync = Arc::new(RwLock::new(ClockSync::new(44100)));
 
@@ -238,6 +238,7 @@ async fn async_main() -> Result<()> {
         client_timing_addr: client_timing_addr.clone(),
         fairplay_msg: fairplay_msg.clone(),
         ecdh_secret: ecdh_secret.clone(),
+        clock_sync: clock_sync.clone(),
     });
 
     // HTTP shared state
@@ -273,7 +274,8 @@ async fn async_main() -> Result<()> {
     }
 
     let mut rtp_handle = tokio::spawn(rtp::start_rtp_receiver(config.rtp_port, jitter_buffer.clone()));
-    let mut control_handle = tokio::spawn(rtp::start_rtp_control(config.control_port));
+    let mut control_handle =
+        tokio::spawn(rtp::start_rtp_control(config.control_port, clock_sync.clone()));
     let mut timing_handle = tokio::spawn(ntp::start_timing_server(config.timing_port, clock_sync.clone(), client_timing_addr.clone()));
     let mut audio_handle = tokio::spawn(audio::run_audio_pipeline(
         jitter_buffer,

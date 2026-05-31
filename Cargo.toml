@@ -1,7 +1,10 @@
+[workspace]
+members = [".", "obs-plugin"]
+
 [package]
 name = "rusty-play"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 name = "rusty_play"
@@ -47,6 +50,7 @@ metal = "0.29"
 core-video-sys = "0.1"
 objc = "0.2"
 dispatch = "0.2"
+coreaudio-rs = "0.11.3"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 libmdns = "0.8"

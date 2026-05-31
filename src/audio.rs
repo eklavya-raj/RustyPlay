@@ -1,15 +1,24 @@
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::StreamConfig;
-use ringbuf::{HeapRb, traits::{Consumer, Producer, Split}};
+use cpal::{SampleFormat, StreamConfig, SupportedStreamConfigRange};
+use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::codec::{AudioCodec, SessionInfo};
-use crate::ntp::ClockSync;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+
+use crate::codec::{alac_magic_cookie_from_fmtp, AudioCodec, SessionInfo};
+use crate::ntp::{ClockSync, AUDIO_LATENCY_SAMPLES};
 use crate::rtp::JitterBuffer;
 
 use std::ffi::c_void;
+
+#[cfg(target_os = "macos")]
+use coreaudio::audio_unit::{AudioUnit, IOType, SampleFormat as CoreAudioSampleFormat};
+#[cfg(target_os = "macos")]
+use coreaudio::audio_unit::render_callback::{self, data};
 
 #[allow(non_camel_case_types)]
 pub type HANDLE_AACDECODER = *mut c_void;
@@ -95,22 +104,15 @@ impl FdkAacDecoder {
                 0,
             );
 
-            // IS_OUTPUT_VALID: either AAC_DEC_OK (0) or a decode error (0x4000..=0x4FFF) where output is concealed
-            let output_valid = err == 0 || (0x4000..=0x4fff).contains(&err);
-
-            if !output_valid {
+            // Only play clean frames — concealed/error output from FDK sounds like crackling.
+            if err != 0 {
                 if (0x2000..=0x2fff).contains(&err) {
-                    // Fatal initialization error
                     return Err(anyhow!("aacDecoder_DecodeFrame fatal init error: 0x{:x}", err));
-                } else {
-                    // Transient/sync/unknown non-fatal error (including 0x5 AAC_DEC_UNKNOWN on corrupt/mock data).
-                    // Log and return empty vector.
-                    debug!("fdk-aac non-fatal decode error: 0x{:x}", err);
-                    return Ok(Vec::new());
                 }
+                debug!("fdk-aac decode error (skipped): 0x{:x}", err);
+                return Ok(Vec::new());
             }
 
-            // If output is valid (even if err != 0, e.g. concealed decode error), retrieve samples
             let info_ptr = aacDecoder_GetStreamInfo(self.handle);
             if info_ptr.is_null() {
                 return Err(anyhow!("Failed to get stream info from fdk-aac"));
@@ -145,12 +147,218 @@ impl Drop for FdkAacDecoder {
 
 
 /// Size of the ring buffer between decoder and audio output (in f32 samples)
-const RING_BUFFER_SIZE: usize = 44100 * 2 * 2; // ~2 seconds of stereo audio at 44.1kHz
+const RING_BUFFER_SIZE: usize = 44100 * 2; // ~1 s stereo @ 44.1 kHz (enough for jitter; saves ~350 KiB)
+
+/// AirPlay empty-audio marker (4 bytes).
+const EMPTY_AUDIO_MARKER: [u8; 4] = [0x00, 0x68, 0x34, 0x00];
+
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+
+/// Cached AES-CBC key/IV; decryptor built per packet (IV reset — matches uxplay).
+struct AesCbcSession {
+    key: [u8; 16],
+    iv: [u8; 16],
+}
+
+impl AesCbcSession {
+    fn from_slices(key: &[u8], iv: &[u8]) -> Option<Self> {
+        Some(Self {
+            key: aes_key16(key)?,
+            iv: aes_iv16(iv)?,
+        })
+    }
+
+    #[inline]
+    fn decrypt_in_place(&self, buf: &mut [u8]) {
+        let decrypt_len = (buf.len() / 16) * 16;
+        if decrypt_len == 0 {
+            return;
+        }
+        if let Ok(dec) = Aes128CbcDec::new_from_slices(&self.key, &self.iv) {
+            let _ = dec.decrypt_padded_mut::<NoPadding>(&mut buf[..decrypt_len]);
+        }
+    }
+}
+
+/// Target decoded PCM queue depth (~200 ms at the *device* sample rate).
+fn target_pcm_samples(sample_rate: u32, channels: u16) -> usize {
+    (sample_rate as usize * channels as usize) / 5
+}
+
+/// Pick the best CPAL output config. macOS built-in output is often 48 kHz while AirPlay is 44.1 kHz.
+fn pick_output_config(
+    device: &cpal::Device,
+    channels: u16,
+    stream_rate: u32,
+) -> Result<(StreamConfig, u32)> {
+    let mut f32_ranges: Vec<SupportedStreamConfigRange> = device
+        .supported_output_configs()?
+        .filter(|r| r.sample_format() == SampleFormat::F32 && r.channels() == channels)
+        .collect();
+
+    if f32_ranges.is_empty() {
+        let default = device.default_output_config()?;
+        let rate = default.sample_rate().0;
+        return Ok((
+            StreamConfig {
+                channels: default.channels(),
+                sample_rate: default.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            },
+            rate,
+        ));
+    }
+
+    // Prefer opening the device at the stream's native rate (no resampling).
+    for range in &f32_ranges {
+        if range.min_sample_rate().0 <= stream_rate && stream_rate <= range.max_sample_rate().0 {
+            let config = range.with_sample_rate(cpal::SampleRate(stream_rate)).config();
+            info!(
+                stream_rate = stream_rate,
+                device_rate = stream_rate,
+                "Audio output: native stream sample rate"
+            );
+            return Ok((config, stream_rate));
+        }
+    }
+
+    // Otherwise use the device default (typically 48000 on Mac) and resample in software.
+    let default = device.default_output_config()?;
+    let rate = default.sample_rate().0;
+    let config = f32_ranges
+        .iter()
+        .find(|r| {
+            r.min_sample_rate().0 <= rate
+                && rate <= r.max_sample_rate().0
+                && r.channels() == channels
+        })
+        .map(|r| r.with_sample_rate(cpal::SampleRate(rate)).config())
+        .unwrap_or_else(|| StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(rate),
+            buffer_size: cpal::BufferSize::Default,
+        });
+
+    if rate != stream_rate {
+        info!(
+            stream_rate = stream_rate,
+            device_rate = rate,
+            "Audio output: resampling in software (common on macOS 48 kHz speakers)"
+        );
+    }
+
+    Ok((config, rate))
+}
+
+/// Linear interpolation resampler for interleaved PCM (44.1 kHz → 48 kHz, etc.).
+fn resample_interleaved(
+    input: &[f32],
+    channels: usize,
+    in_rate: u32,
+    out_rate: u32,
+    phase: &mut f64,
+) -> Vec<f32> {
+    if in_rate == out_rate || input.is_empty() || channels == 0 {
+        return input.to_vec();
+    }
+    let in_frames = input.len() / channels;
+    if in_frames < 2 {
+        return input.to_vec();
+    }
+
+    let step = in_rate as f64 / out_rate as f64;
+    let mut out = Vec::new();
+    let mut pos = *phase;
+
+    while pos < (in_frames - 1) as f64 {
+        let i0 = pos as usize;
+        let i1 = i0 + 1;
+        let frac = pos - i0 as f64;
+        for ch in 0..channels {
+            let s0 = input[i0 * channels + ch] as f64;
+            let s1 = input[i1 * channels + ch] as f64;
+            out.push((s0 + (s1 - s0) * frac) as f32);
+        }
+        pos += step;
+    }
+
+    *phase = pos - (in_frames - 1) as f64;
+    out
+}
+
+/// uxplay accepts these first payload bytes after decryption (raop_buffer.c).
+fn is_valid_decrypted_payload(codec: AudioCodec, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    match codec {
+        AudioCodec::Alac => data[0] == 0x20,
+        AudioCodec::AacLc | AudioCodec::AacEld => matches!(
+            data[0],
+            0x20 | 0x80 | 0x81 | 0x82 | 0x8c | 0x8d | 0x8e
+        ),
+        AudioCodec::Pcm => true,
+    }
+}
+
+fn aes_key16(key: &[u8]) -> Option<[u8; 16]> {
+    if key.len() >= 16 {
+        let mut k = [0u8; 16];
+        k.copy_from_slice(&key[..16]);
+        Some(k)
+    } else {
+        None
+    }
+}
+
+fn aes_iv16(iv: &[u8]) -> Option<[u8; 16]> {
+    aes_key16(iv)
+}
+
+fn refresh_session_keys(
+    session_info: &Arc<RwLock<Option<SessionInfo>>>,
+    cached_aes: &mut Option<AesCbcSession>,
+) {
+    if cached_aes.is_some() {
+        return;
+    }
+    if let Ok(guard) = session_info.read() {
+        if let Some(si) = guard.as_ref() {
+            if let (Some(key), Some(iv)) = (&si.aes_key, &si.aes_iv) {
+                if let Some(session) = AesCbcSession::from_slices(key, iv) {
+                    info!(
+                        stream_type = ?si.stream_type,
+                        "Audio AES-CBC keys loaded from session_info"
+                    );
+                    *cached_aes = Some(session);
+                }
+            }
+        }
+    }
+}
+
+fn make_alac_decoder(
+    sample_rate: u32,
+    channels: u16,
+    fmtp: Option<&str>,
+) -> Result<Box<dyn symphonia::core::codecs::Decoder>> {
+    use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_ALAC};
+    let mut params = CodecParameters::new();
+    params.codec = CODEC_TYPE_ALAC;
+    params.sample_rate = Some(sample_rate);
+    let magic_cookie = alac_magic_cookie_from_fmtp(fmtp, sample_rate, channels);
+    debug!(magic_cookie = ?magic_cookie, fmtp = ?fmtp, "ALAC decoder magic cookie");
+    params.extra_data = Some(magic_cookie.into_boxed_slice());
+    symphonia::default::get_codecs()
+        .make(&params, &DecoderOptions::default())
+        .map(|d| d as Box<dyn symphonia::core::codecs::Decoder>)
+        .map_err(|e| anyhow!("Failed to create ALAC decoder: {}", e))
+}
 
 /// Audio pipeline state
 pub struct AudioPipeline {
-    /// Whether the pipeline is currently active
-    active: bool,
+    /// Playout has started (prefill complete); never cleared on transient underrun.
+    playout_started: bool,
     /// Sample rate
     sample_rate: u32,
     /// Number of channels
@@ -160,7 +368,7 @@ pub struct AudioPipeline {
 impl AudioPipeline {
     pub fn new() -> Self {
         AudioPipeline {
-            active: false,
+            playout_started: false,
             sample_rate: 44100,
             channels: 2,
         }
@@ -238,7 +446,7 @@ fn convert_audio_buffer(buf: &symphonia::core::audio::AudioBufferRef) -> Vec<f32
 pub async fn run_audio_pipeline(
     jitter_buffer: Arc<Mutex<JitterBuffer>>,
     session_info: Arc<RwLock<Option<SessionInfo>>>,
-    _clock_sync: Arc<RwLock<ClockSync>>,
+    clock_sync: Arc<RwLock<ClockSync>>,
 ) -> Result<()> {
     info!("Audio pipeline starting — waiting for session info");
 
@@ -272,13 +480,51 @@ pub async fn run_audio_pipeline(
     // in a tokio::spawn task.
     let jb = jitter_buffer.clone();
     let si = session_info.clone();
+    let cs = clock_sync.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_decode_loop(jb, si, codec, sample_rate, channels) {
+        if let Err(e) = run_decode_loop(jb, si, cs, codec, sample_rate, channels) {
             tracing::error!(error = %e, "Audio decode loop exited with error");
         }
     }).await?;
 
     Ok(())
+}
+
+/// Fade-in duration at stream start to avoid clicks from an empty PCM ring.
+const STARTUP_FADE_MS: u64 = 200;
+
+/// Sleep until this RTP timestamp's scheduled playout instant.
+///
+/// Latency is encoded in the anchor (`RECORD` → ref+250 ms, `SYNC` → ref=now).
+fn wait_for_rtp_playout(clock_sync: &Arc<RwLock<ClockSync>>, rtp_timestamp: u32) {
+    let playout = clock_sync
+        .read()
+        .ok()
+        .and_then(|sync| sync.rtp_to_playout_time(rtp_timestamp));
+    if let Some(when) = playout {
+        let now = Instant::now();
+        if when > now {
+            std::thread::sleep(when - now);
+        }
+    }
+}
+
+/// Block decode when the PCM ring is too far ahead of the device callback.
+fn wait_for_pcm_headroom(
+    producer: &impl ringbuf::traits::Observer,
+    device_rate: u32,
+    channels: u16,
+) {
+    let target = target_pcm_samples(device_rate, channels);
+    let max_queued = target * 2;
+    let mut spins = 0;
+    while producer.occupied_len() >= max_queued {
+        spins += 1;
+        if spins > 2000 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// Blocking decode loop that runs on a dedicated thread.
@@ -287,89 +533,168 @@ pub async fn run_audio_pipeline(
 fn run_decode_loop(
     jitter_buffer: Arc<Mutex<JitterBuffer>>,
     session_info: Arc<RwLock<Option<SessionInfo>>>,
+    clock_sync: Arc<RwLock<ClockSync>>,
     mut codec: AudioCodec,
     mut sample_rate: u32,
     mut channels: u16,
 ) -> Result<()> {
-    // Set up CPAL audio output
-    let host = cpal::default_host();
-    let device = host.default_output_device()
-        .ok_or_else(|| anyhow!("No default audio output device found"))?;
+    let mut output_rate = sample_rate;
+    let mut needs_resample = false;
+    let mut resample_phase = 0.0f64;
 
-    info!(device = %device.name().unwrap_or_default(), "Using audio output device");
-
-    let config = StreamConfig {
-        channels,
-        sample_rate: cpal::SampleRate(sample_rate),
-        buffer_size: cpal::BufferSize::Fixed(256),
-    };
-
-    // Create a lock-free ring buffer for decoded audio
+    // Lock-free SPSC ring between decode thread and audio callback.
     let rb = HeapRb::<f32>::new(RING_BUFFER_SIZE);
     let (mut producer, mut consumer) = rb.split();
+    let drain_pcm = Arc::new(AtomicBool::new(false));
+    let drain_cb = drain_pcm.clone();
+    let fade_samples_total = Arc::new(AtomicUsize::new(0));
+    let fade_samples_left = Arc::new(AtomicUsize::new(0));
+    let fade_total_cb = fade_samples_total.clone();
+    let fade_left_cb = fade_samples_left.clone();
+    let ch = channels as usize;
 
-    // Start the CPAL output stream
-    let stream = device.build_output_stream(
-        &config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Fill the output buffer from the ring buffer
-            for sample in data.iter_mut() {
-                *sample = consumer.try_pop().unwrap_or(0.0);
+    #[cfg(not(target_os = "macos"))]
+    let mut hold = vec![0.0f32; ch];
+
+    #[cfg(target_os = "macos")]
+    let mut _audio_unit: Option<AudioUnit> = None;
+
+    #[cfg(target_os = "macos")]
+    {
+        let host = cpal::default_host();
+        let device = host.default_output_device()
+            .ok_or_else(|| anyhow!("No default audio output device found"))?;
+
+        info!(device = %device.name().unwrap_or_default(), "Using audio output device via CoreAudio");
+
+        let mut audio_unit = AudioUnit::new(IOType::DefaultOutput)?;
+        let stream_format = audio_unit.input_stream_format()?;
+        if stream_format.sample_format != CoreAudioSampleFormat::F32 {
+            return Err(anyhow!("CoreAudio output stream format is not f32"));
+        }
+
+        output_rate = stream_format.sample_rate as u32;
+        needs_resample = output_rate != sample_rate;
+        resample_phase = 0.0f64;
+
+        let consumer = Arc::new(Mutex::new(consumer));
+        let hold = Arc::new(Mutex::new(vec![0.0f32; ch]));
+
+        type Args = render_callback::Args<data::NonInterleaved<f32>>;
+        audio_unit.set_render_callback(move |args: Args| {
+            let render_callback::Args { num_frames, mut data, .. } = args;
+            if drain_cb.swap(false, Ordering::AcqRel) {
+                if let Ok(mut consumer_lock) = consumer.lock() {
+                    while consumer_lock.try_pop().is_some() {}
+                }
+                if let Ok(mut hold_buf) = hold.lock() {
+                    hold_buf.fill(0.0);
+                }
+                fade_left_cb.store(0, Ordering::Release);
+                fade_total_cb.store(0, Ordering::Release);
             }
-        },
-        move |err| {
-            tracing::error!(error = %err, "Audio output stream error");
-        },
-        None,
-    )?;
 
-    stream.play()?;
-    info!("Audio output stream started");
+            let mut hold_buf = hold.lock().unwrap_or_else(|e| e.into_inner());
+            // Pre-fetch consumer lock once per callback instead of per-frame to reduce lock contention.
+            let mut consumer_lock_opt = consumer.try_lock().ok();
+            
+            for frame_idx in 0..num_frames {
+                for (channel_idx, channel_data) in data.channels_mut().enumerate() {
+                    let sample = if let Some(ref mut consumer_lock) = consumer_lock_opt {
+                        consumer_lock.try_pop().unwrap_or(hold_buf[channel_idx])
+                    } else {
+                        hold_buf[channel_idx]
+                    };
+                    channel_data[frame_idx] = sample;
+                    hold_buf[channel_idx] = sample;
+                }
+                let left = fade_left_cb.load(Ordering::Relaxed);
+                let total = fade_total_cb.load(Ordering::Relaxed);
+                if left > 0 && total > 0 {
+                    let done = total - left;
+                    for channel_data in data.channels_mut() {
+                        channel_data[frame_idx] *= done as f32 / total as f32;
+                    }
+                    fade_left_cb.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            // Release consumer lock explicitly before callback exits
+            drop(consumer_lock_opt);
+            Ok(())
+        })?;
+
+        audio_unit.start()?;
+        info!("CoreAudio output stream started");
+        _audio_unit = Some(audio_unit);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Set up CPAL audio output
+        let host = cpal::default_host();
+        let device = host.default_output_device()
+            .ok_or_else(|| anyhow!("No default audio output device found"))?;
+
+        info!(device = %device.name().unwrap_or_default(), "Using audio output device");
+
+        let (output_config, rate) = pick_output_config(&device, channels, sample_rate)?;
+        output_rate = rate;
+        needs_resample = output_rate != sample_rate;
+
+        let stream = device.build_output_stream(
+            &output_config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if drain_cb.swap(false, Ordering::AcqRel) {
+                    while consumer.try_pop().is_some() {}
+                    hold.fill(0.0);
+                    fade_left_cb.store(0, Ordering::Release);
+                    fade_total_cb.store(0, Ordering::Release);
+                }
+                for frame in data.chunks_mut(ch) {
+                    for (i, sample) in frame.iter_mut().enumerate() {
+                        if let Some(v) = consumer.try_pop() {
+                            *sample = v;
+                            hold[i] = v;
+                        } else {
+                            // Hold last sample on underrun (zeros cause audible clicks).
+                            *sample = hold[i];
+                        }
+                        let left = fade_left_cb.load(Ordering::Relaxed);
+                        let total = fade_total_cb.load(Ordering::Relaxed);
+                        if left > 0 && total > 0 {
+                            let done = total - left;
+                            *sample *= done as f32 / total as f32;
+                            fade_left_cb.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            },
+            move |err| {
+                tracing::error!(error = %err, "Audio output stream error");
+            },
+            None,
+        )?;
+
+        stream.play()?;
+        info!("Audio output stream started");
+    }
 
     // Local cache for AES-CBC decryption keys to avoid locking RwLock for every single packet.
     // Audio RTP packets ALWAYS use AES-CBC, regardless of stream type (AudioOnly or Mirroring).
     // AES-CTR is only used for video mirroring data on a separate socket (see uxplay/lib/mirror_buffer.c).
-    let mut cached_aes_key: Option<Vec<u8>> = None;
-    let mut cached_aes_iv: Option<Vec<u8>> = None;
+    let mut cached_aes: Option<AesCbcSession> = None;
 
-    // Initialize ALAC decoder
+    let session_fmtp = session_info
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|si| si.fmtp.clone()));
+
     let mut alac_decoder = if codec == AudioCodec::Alac {
-        use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_ALAC};
-        let mut params = CodecParameters::new();
-        params.codec = CODEC_TYPE_ALAC;
-        params.sample_rate = Some(sample_rate);
-        
-        // ALAC ALACSpecificConfig (24 bytes, from the ALAC spec):
-        // Format: [frame_length (4), compatible_version (1), bit_depth (1), pb (1), mb (1), kb (1),
-        //          num_channels (1), max_run (2), max_frame_bytes (4), avg_bit_rate (4), sample_rate (4)]
-        //
-        // These values come from the SDP fmtp line:
-        //   "352 0 16 40 10 14 2 255 0 0 44100"
-        //     ^0  ^1 ^2 ^3 ^4 ^5 ^6 ^7 ^8 ^9 ^10
-        //     frame_len  bits pb mb kb ch  maxrun maxframebytes avgbitrate samplerate
-        //
-        // NOTE: avg_bit_rate field comes BEFORE sample_rate in the binary layout.
-        let sr_bytes = sample_rate.to_be_bytes();
-        let magic_cookie = vec![
-            0x00, 0x00, 0x01, 0x60,           // frame_length: 352 samples
-            0x00,                              // compatible_version: 0
-            0x10,                              // bit_depth: 16
-            0x28,                              // pb: 40
-            0x0a,                              // mb: 10
-            0x0e,                              // kb: 14
-            0x02,                              // num_channels: 2
-            0x00, 0xff,                        // max_run: 255
-            0x00, 0x00, 0x00, 0x00,            // max_frame_bytes: 0 (unknown)
-            0x00, 0x00, 0x00, 0x00,            // avg_bit_rate: 0
-            sr_bytes[0], sr_bytes[1], sr_bytes[2], sr_bytes[3], // sample_rate: from SDP
-        ];
-        info!(magic_cookie = ?magic_cookie, sample_rate = sample_rate, "ALAC magic cookie");
-        params.extra_data = Some(magic_cookie.into_boxed_slice());
-        
-        let decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
-            .map_err(|e| anyhow!("Failed to create ALAC decoder: {}", e))?;
-        Some(decoder)
+        Some(make_alac_decoder(
+            sample_rate,
+            channels,
+            session_fmtp.as_deref(),
+        )?)
     } else {
         None
     };
@@ -398,8 +723,11 @@ fn run_decode_loop(
     let mut pipeline = AudioPipeline::new();
     pipeline.sample_rate = sample_rate;
     pipeline.channels = channels;
+    let mut last_flush_generation = 0u64;
 
     loop {
+        refresh_session_keys(&session_info, &mut cached_aes);
+
         // Check for dynamic audio format changes in session_info
         let mut format_changed = false;
         if let Ok(info_guard) = session_info.read() {
@@ -424,32 +752,14 @@ fn run_decode_loop(
 
         if format_changed {
             // Re-initialize ALAC decoder
+            let fmtp = session_info
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|si| si.fmtp.clone()));
             alac_decoder = if codec == AudioCodec::Alac {
-                use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_ALAC};
-                let mut params = CodecParameters::new();
-                params.codec = CODEC_TYPE_ALAC;
-                params.sample_rate = Some(sample_rate);
-                
-                let sr_bytes = sample_rate.to_be_bytes();
-                let magic_cookie = vec![
-                    0x00, 0x00, 0x01, 0x60, // frame_length: 352 samples
-                    0x00,                   // compatible_version: 0
-                    0x10,                   // bit_depth: 16
-                    0x28,                   // pb: 40
-                    0x0a,                   // mb: 10
-                    0x0e,                   // kb: 14
-                    0x02,                   // num_channels: 2
-                    0x00, 0xff,             // max_run: 255
-                    0x00, 0x00, 0x00, 0x00, // max_frame_bytes: 0 (unknown)
-                    0x00, 0x00, 0x00, 0x00, // avg_bit_rate: 0
-                    sr_bytes[0], sr_bytes[1], sr_bytes[2], sr_bytes[3],
-                ];
-                params.extra_data = Some(magic_cookie.into_boxed_slice());
-                
-                let decoder = symphonia::default::get_codecs()
-                    .make(&params, &DecoderOptions::default())
-                    .expect("Failed to create ALAC decoder on format change");
-                Some(decoder)
+                Some(make_alac_decoder(sample_rate, channels, fmtp.as_deref()).expect(
+                    "Failed to create ALAC decoder on format change",
+                ))
             } else {
                 None
             };
@@ -470,10 +780,11 @@ fn run_decode_loop(
 
             pipeline.sample_rate = sample_rate;
             pipeline.channels = channels;
-            
+            drain_pcm.store(true, Ordering::Release);
+            resample_phase = 0.0;
+
             // Clear cached keys to force re-reading from session_info
-            cached_aes_key = None;
-            cached_aes_iv = None;
+            cached_aes = None;
 
             info!(
                 codec = %codec,
@@ -486,16 +797,52 @@ fn run_decode_loop(
         // Check if jitter buffer has enough data
         let packet = {
             let mut jb = jitter_buffer.lock().unwrap();
-            if !pipeline.active
-                && jb.is_ready() {
-                    pipeline.active = true;
-                    info!(
-                        buf_size = jb.len(),
-                        "Jitter buffer ready — starting playout"
-                    );
+
+            // RTSP RECORD/FLUSH/TEARDOWN cleared the buffer — wait for prefill again.
+            let flush_gen = jb.flush_generation();
+            if flush_gen != last_flush_generation {
+                last_flush_generation = flush_gen;
+                pipeline.playout_started = false;
+                drain_pcm.store(true, Ordering::Release);
+                fade_samples_left.store(0, Ordering::Release);
+                fade_samples_total.store(0, Ordering::Release);
+                resample_phase = 0.0;
+                if let Ok(mut sync) = clock_sync.write() {
+                    sync.reset_playout_anchor();
                 }
-            if pipeline.active {
-                jb.pop()
+                debug!(
+                    flush_generation = flush_gen,
+                    "Jitter buffer flushed — drained PCM and waiting to re-prefill"
+                );
+            }
+
+            if !pipeline.playout_started && jb.is_ready() && cached_aes.is_some() {
+                jb.sync_expected_to_front();
+                if let Some(rtp_ts) = jb.front_rtp_timestamp() {
+                    if let Ok(mut sync) = clock_sync.write() {
+                        if !sync.has_rtp_anchor() {
+                            sync.set_rtp_reference(rtp_ts);
+                        }
+                    }
+                }
+                let fade_len =
+                    (output_rate as u64 * STARTUP_FADE_MS * ch as u64 / 1000) as usize;
+                fade_samples_total.store(fade_len, Ordering::Release);
+                fade_samples_left.store(fade_len, Ordering::Release);
+                pipeline.playout_started = true;
+                info!(
+                    buf_size = jb.len(),
+                    min_fill = jb.min_fill(),
+                    rtp_pacing = clock_sync.read().map(|s| s.has_rtp_anchor()).unwrap_or(false),
+                    sync_count = clock_sync.read().map(|s| s.sync_count()).unwrap_or(0),
+                    audio_latency_samples = AUDIO_LATENCY_SAMPLES,
+                    startup_fade_samples = fade_len,
+                    "Jitter buffer ready — starting playout"
+                );
+            }
+
+            if pipeline.playout_started {
+                jb.pop_next()
             } else {
                 None
             }
@@ -503,104 +850,28 @@ fn run_decode_loop(
 
         match packet {
             Some(pkt) => {
-                info!(
-                    seq = pkt.sequence,
-                    payload_type = pkt.payload_type,
-                    payload_len = pkt.payload.len(),
-                    codec = %codec,
-                    first_bytes = format!("{:02x} {:02x} {:02x} {:02x}", 
-                        pkt.payload.get(0).unwrap_or(&0),
-                        pkt.payload.get(1).unwrap_or(&0),
-                        pkt.payload.get(2).unwrap_or(&0),
-                        pkt.payload.get(3).unwrap_or(&0)),
-                    "Received packet from jitter buffer"
-                );
-                // Only process audio packets (PT=96 typically)
-                // Note: 4-byte payloads ARE valid ALAC frames (e.g. silence), do not skip them
+                wait_for_pcm_headroom(&producer, output_rate, channels);
+                wait_for_rtp_playout(&clock_sync, pkt.timestamp);
+
                 if pkt.payload_type == 96 && !pkt.payload.is_empty() {
-                    // Skip empty packet markers (matching uxplay behavior)
-                    // Empty packet marker: 0x00 0x68 0x34 0x00
-                    if pkt.payload.len() == 4 
-                        && pkt.payload[0] == 0x00 
-                        && pkt.payload[1] == 0x68 
-                        && pkt.payload[2] == 0x34 
-                        && pkt.payload[3] == 0x00 {
-                        debug!(seq = pkt.sequence, "Skipping empty packet marker");
+                    if pkt.payload.as_slice() == EMPTY_AUDIO_MARKER {
                         continue;
                     }
-                    
-                    let mut decrypted_payload = pkt.payload.clone();
 
-                    // Fetch audio AES key/IV from session_info if not yet cached
-                    if cached_aes_key.is_none() {
-                        if let Ok(info_guard) = session_info.read() {
-                            if let Some(ref si) = *info_guard {
-                                if si.aes_key.is_some() {
-                                    cached_aes_key = si.aes_key.clone();
-                                    cached_aes_iv = si.aes_iv.clone();
-                                    info!(
-                                        has_audio_key = cached_aes_key.is_some(),
-                                        has_audio_iv = cached_aes_iv.is_some(),
-                                        stream_type = ?si.stream_type,
-                                        "Audio AES-CBC keys loaded from session_info"
-                                    );
-                                } else {
-                                    warn!("session_info has no AES key yet — audio cannot be decrypted");
-                                }
-                            }
-                        }
+                    let mut decrypted_payload = pkt.payload;
+                    if let Some(aes) = &cached_aes {
+                        aes.decrypt_in_place(&mut decrypted_payload);
                     }
 
-                    // AES-CBC decryption for audio packets (ALWAYS, regardless of stream type).
-                    // This matches uxplay's raop_buffer.c which always uses aes_cbc_decrypt.
-                    // AES-CTR is only for video mirroring data on a separate socket (mirror_buffer.c).
-                    //
-                    // IMPORTANT: The IV must be reset to the original value for EACH packet
-                    // (matching uxplay's aes_cbc_reset per packet in raop_buffer.c)
-                    //
-                    // NOTE: We process ALL payload sizes, including < 16 bytes.
-                    // For small payloads (e.g., 4-byte ALAC silence frames):
-                    //   - encrypted_len = (4 / 16) * 16 = 0 → no-op
-                    //   - All bytes remain as-is ("remainder")
-                    // This matches the reference implementation in uxplay/lib/raop_buffer.c:137
-                    if let (Some(key), Some(iv)) = (&cached_aes_key, &cached_aes_iv) {
-                        use cbc::cipher::KeyIvInit;
-                        type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
-                        // A new Decryptor is created each time, which resets the IV — correct per-packet behavior
-                        if let Ok(decryptor) = Aes128CbcDec::new_from_slices(key, iv) {
-                            use cbc::cipher::block_padding::NoPadding;
-                            use cbc::cipher::BlockDecryptMut;
-                            let decrypt_len = (decrypted_payload.len() / 16) * 16;
-                            
-                            // Only attempt decryption if there are complete 16-byte blocks
-                            if decrypt_len > 0 {
-                                let _ = decryptor.decrypt_padded_mut::<NoPadding>(&mut decrypted_payload[..decrypt_len]);
-                            }
-                            // Remainder bytes (if any) are already in place and don't need copying
-                            
-                            debug!(
-                                seq = pkt.sequence,
-                                payload_len = decrypted_payload.len(),
-                                decrypt_len = decrypt_len,
-                                "AES-CBC decryption performed"
-                            );
-                        } else {
-                            warn!(key_len=key.len(), iv_len=iv.len(), "AES-128-CBC decryptor init failed — bad key/iv length");
-                        }
-                    }
-                    
-                    // Validate decrypted ALAC frames (Requirement 9.1)
-                    // Log first byte after decryption — uxplay expects 0x20 for valid ALAC
-                    if codec == AudioCodec::Alac && !decrypted_payload.is_empty() {
-                        let first_byte = decrypted_payload[0];
-                        let is_valid_alac = first_byte == 0x20;
-                        if !is_valid_alac {
-                            warn!(
-                                first_byte = format!("0x{:02x}", first_byte),
-                                payload_len = decrypted_payload.len(),
-                                "Decrypted ALAC frame does NOT start with 0x20 — possible decryption failure"
-                            );
-                        }
+                    if !is_valid_decrypted_payload(codec, &decrypted_payload) {
+                        debug!(
+                            seq = pkt.sequence,
+                            first_byte = decrypted_payload.first().map(|b| format!("0x{:02x}", b)),
+                            len = decrypted_payload.len(),
+                            codec = %codec,
+                            "Skipping packet with invalid decrypted payload"
+                        );
+                        continue;
                     }
 
                     if codec == AudioCodec::Alac {
@@ -616,11 +887,24 @@ fn run_decode_loop(
                                 Ok(buf) => {
                                     let samples = convert_audio_buffer(&buf);
                                     if !samples.is_empty() {
-                                        let written = producer.push_slice(&samples);
-                                        if written < samples.len() {
+                                        let pcm = if needs_resample {
+                                            resample_interleaved(
+                                                &samples,
+                                                ch,
+                                                sample_rate,
+                                                output_rate,
+                                                &mut resample_phase,
+                                            )
+                                        } else {
+                                            samples
+                                        };
+                                        let total = pcm.len();
+                                        let written =
+                                            push_pcm_samples(&mut producer, &pcm, output_rate, channels);
+                                        if written < total {
                                             debug!(
                                                 written = written,
-                                                total = samples.len(),
+                                                total = total,
                                                 "Ring buffer full, dropped samples"
                                             );
                                         }
@@ -639,10 +923,9 @@ fn run_decode_loop(
                             warn!("ALAC decoder is None — codec was not initialized!");
                         }
                     } else if codec == AudioCodec::AacLc || codec == AudioCodec::AacEld {
-                        info!("Attempting AAC decode");
                         // Skip AAC-ELD "no data" marker packets (4-byte marker 0x00 0x68 0x34 0x00)
                         if decrypted_payload.len() == 4 && decrypted_payload[0] == 0x00 && decrypted_payload[1] == 0x68 {
-                            info!("Skipping AAC-ELD no-data marker packet");
+                            debug!(seq = pkt.sequence, "Skipping AAC-ELD no-data marker packet");
                             continue;
                         }
                         if let Some(ref mut decoder) = aac_decoder {
@@ -658,11 +941,24 @@ fn run_decode_loop(
                                             max = max_sample,
                                             "AAC decode successful"
                                         );
-                                        let written = producer.push_slice(&samples);
-                                        if written < samples.len() {
+                                        let pcm = if needs_resample {
+                                            resample_interleaved(
+                                                &samples,
+                                                ch,
+                                                sample_rate,
+                                                output_rate,
+                                                &mut resample_phase,
+                                            )
+                                        } else {
+                                            samples
+                                        };
+                                        let total = pcm.len();
+                                        let written =
+                                            push_pcm_samples(&mut producer, &pcm, output_rate, channels);
+                                        if written < total {
                                             debug!(
                                                 written = written,
-                                                total = samples.len(),
+                                                total = total,
                                                 "Ring buffer full, dropped samples"
                                             );
                                         }
@@ -688,11 +984,24 @@ fn run_decode_loop(
                                 sample as f32 / 32768.0
                             })
                             .collect();
-                        let written = producer.push_slice(&samples);
-                        if written < samples.len() {
+                        let pcm = if needs_resample {
+                            resample_interleaved(
+                                &samples,
+                                ch,
+                                sample_rate,
+                                output_rate,
+                                &mut resample_phase,
+                            )
+                        } else {
+                            samples
+                        };
+                        let total = pcm.len();
+                        let written =
+                            push_pcm_samples(&mut producer, &pcm, output_rate, channels);
+                        if written < total {
                             debug!(
                                 written = written,
-                                total = samples.len(),
+                                total = total,
                                 "Ring buffer full, dropped samples"
                             );
                         }
@@ -700,15 +1009,54 @@ fn run_decode_loop(
                 }
             }
             None => {
-                // Buffer underrun or not yet ready — brief sleep
-                if pipeline.active {
-                    debug!("Jitter buffer underrun");
-                    pipeline.active = false;
+                // Prefill wait or transient underrun — CPAL outputs silence from empty ring.
+                if pipeline.playout_started {
+                    if producer.occupied_len() >= target_pcm_samples(output_rate, channels) * 2 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    } else {
+                        debug!("Jitter buffer underrun (outputting silence until packets arrive)");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
     }
+}
+
+/// Push decoded PCM to the ring buffer (decode thread only).
+fn push_pcm_samples(
+    producer: &mut impl Producer<Item = f32>,
+    samples: &[f32],
+    device_rate: u32,
+    channels: u16,
+) -> usize {
+    if samples.is_empty() {
+        return 0;
+    }
+
+    let target = target_pcm_samples(device_rate, channels);
+    let max_queued = target * 2;
+    let mut offset = 0;
+    let mut spins = 0;
+    while offset < samples.len() {
+        if producer.vacant_len() == 0 || producer.occupied_len() >= max_queued {
+            spins += 1;
+            if spins > 100 {
+                warn!(
+                    dropped_samples = samples.len() - offset,
+                    "PCM ring buffer full — dropping samples"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(500));
+            continue;
+        }
+        spins = 0;
+        offset += producer.push_slice(&samples[offset..]);
+    }
+    offset
 }
 
 #[cfg(test)]
@@ -718,9 +1066,18 @@ mod tests {
     #[test]
     fn test_audio_pipeline_new() {
         let pipeline = AudioPipeline::new();
-        assert!(!pipeline.active);
+        assert!(!pipeline.playout_started);
         assert_eq!(pipeline.sample_rate, 44100);
         assert_eq!(pipeline.channels, 2);
+    }
+
+    #[test]
+    fn test_resample_44100_to_48000() {
+        let mut phase = 0.0;
+        // 2 frames stereo = 4 samples at 44100
+        let input = vec![0.0f32, 0.0, 1.0, 1.0];
+        let out = resample_interleaved(&input, 2, 44100, 48000, &mut phase);
+        assert!(out.len() > 4, "48 kHz should produce more samples than 44.1 kHz input");
     }
 
     #[test]

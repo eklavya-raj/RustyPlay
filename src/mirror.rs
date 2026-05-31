@@ -1,7 +1,9 @@
 use anyhow::Result;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
-use tokio::net::TcpListener;
+use std::thread;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 use aes::cipher::{BlockEncrypt, KeyInit};
 
@@ -96,6 +98,7 @@ pub async fn start_mirroring_server(port: u16, session_info: Arc<RwLock<Option<S
         match listener.accept().await {
             Ok((stream, peer)) => {
                 info!(peer = %peer, "Mirroring client connection accepted");
+                warn!(peer = %peer, "Mirroring mode currently supports only video; audio is not routed through the mirror session yet");
                 let session_info_clone = session_info.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, session_info_clone).await {
@@ -115,6 +118,98 @@ pub async fn start_mirroring_server(port: u16, session_info: Arc<RwLock<Option<S
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static FORCE_SOFTWARE_DECODER: AtomicBool = AtomicBool::new(false);
+
+enum MirrorVideoCmd {
+    Shutdown,
+    CodecConfig {
+        annexb: Vec<u8>,
+        width: f32,
+        height: f32,
+    },
+    Frame {
+        avcc: Vec<u8>,
+        ntp: u64,
+    },
+}
+
+/// Decode/display on a dedicated thread so the TCP reader never stalls (prevents burst jitter).
+fn spawn_mirror_video_worker(use_hardware: bool) -> SyncSender<MirrorVideoCmd> {
+    let (tx, rx) = mpsc::sync_channel(48);
+    thread::Builder::new()
+        .name("mirror-video".into())
+        .spawn(move || mirror_video_worker(rx, use_hardware))
+        .expect("spawn mirror-video thread");
+    tx
+}
+
+/// O(n) over payload, zero allocations (hot path per video frame).
+#[inline]
+fn validate_avcc(payload: &[u8]) -> bool {
+    let mut offset = 0;
+    let len = payload.len();
+    while offset < len {
+        if offset + 4 > len {
+            return false;
+        }
+        let nalu_len = u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]) as usize;
+        if offset + 4 + nalu_len > len {
+            return false;
+        }
+        if payload[offset + 4] & 0x80 != 0 {
+            return false;
+        }
+        offset += 4 + nalu_len;
+    }
+    true
+}
+
+fn mirror_video_worker(rx: mpsc::Receiver<MirrorVideoCmd>, use_hardware: bool) {
+    let mut pipeline: Option<VideoPipeline> = None;
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            MirrorVideoCmd::Shutdown => break,
+            MirrorVideoCmd::CodecConfig {
+                annexb,
+                width,
+                height,
+            } => {
+                if pipeline.is_none() {
+                    match VideoPipeline::new(use_hardware) {
+                        Ok(p) => {
+                            info!("VideoPipeline initialized on mirror worker thread");
+                            pipeline = Some(p);
+                        }
+                        Err(e) => warn!("Failed to initialize VideoPipeline: {:?}", e),
+                    }
+                }
+                if let Some(p) = &mut pipeline {
+                    if let Err(e) = p.process_codec_config(&annexb, width, height) {
+                        warn!("Failed to process codec config: {:?}", e);
+                    }
+                }
+            }
+            MirrorVideoCmd::Frame { avcc, ntp } => {
+                if let Some(p) = &mut pipeline {
+                    if let Err(e) = p.process_avcc_packet(&avcc, ntp) {
+                        warn!("Failed to process video frame: {:?}", e);
+                        if !p.is_window_open() {
+                            info!("Video window closed, stopping mirror worker");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(mut p) = pipeline {
+        let _ = p.shutdown();
+    }
+}
 
 /// Handle a single mirroring TCP stream session.
 async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLock<Option<SessionInfo>>>) -> Result<()> {
@@ -154,8 +249,8 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
         }
     };
 
-    // Initialize video pipeline (lazy initialization on first video frame or codec config)
-    let mut video_pipeline: Option<VideoPipeline> = None;
+    let use_hardware = !FORCE_SOFTWARE_DECODER.load(Ordering::Relaxed);
+    let video_tx = spawn_mirror_video_worker(use_hardware);
 
     let mut header = [0u8; 128];
     loop {
@@ -180,69 +275,19 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                 // Decrypt payload in-place
                 decryptor.decrypt_in_place(&mut payload);
 
-                // Convert AVCC length prefixes (4-byte big-endian) to Annex-B start codes ([0, 0, 0, 1])
-                let mut offset = 0;
-                let mut nal_units = Vec::new();
-                let mut is_valid = true;
-
-                while offset < payload_size {
-                    if offset + 4 > payload_size {
-                        is_valid = false;
-                        break;
-                    }
-                    let nalu_len = u32::from_be_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
-                    if offset + 4 + nalu_len > payload_size {
-                        is_valid = false;
-                        break;
-                    }
-
-                    // Validate forbidden_zero_bit (must be 0) of H.264 NAL header
-                    if (payload[offset + 4] & 0x80) != 0 {
-                        is_valid = false;
-                        break;
-                    }
-
-                    // Convert to Annex-B start code
-                    payload[offset..offset+4].copy_from_slice(&[0, 0, 0, 1]);
-
-                    // Parse H.264 NAL Unit Type
-                    let nalu_type = payload[offset + 4] & 0x1f;
-                    let nalu_type_str = match nalu_type {
-                        1 => "Non-IDR Slice",
-                        5 => "IDR Slice",
-                        6 => "SEI",
-                        7 => "SPS",
-                        8 => "PPS",
-                        _ => "Other NAL",
-                    };
-                    nal_units.push((nalu_type_str, nalu_len));
-
-                    offset += 4 + nalu_len;
-                }
-
-                if is_valid {
-                    info!(
-                        payload_size = payload_size,
-                        ntp_timestamp = ntp_timestamp_raw,
-                        option = payload_option,
-                        nal_units = ?nal_units,
-                        "Received video frame (decrypted & Annex-B formatted)"
-                    );
-
-                    // Process frame through VideoPipeline (only if already initialized)
-                    // Note: VideoPipeline should be initialized by a valid codec config (type 0x01) first
-                    if let Some(ref mut pipeline) = video_pipeline {
-                        if let Err(e) = pipeline.process_nal_unit(&payload) {
-                            warn!("Failed to process video frame: {:?}", e);
-                            // If window was closed, break the loop
-                            if !pipeline.is_window_open() {
-                                info!("Video window closed by user, ending session");
-                                break;
-                            }
+                if validate_avcc(&payload) {
+                    match video_tx.try_send(MirrorVideoCmd::Frame {
+                        avcc: payload,
+                        ntp: ntp_timestamp_raw,
+                    }) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            debug!("Mirror video queue full — dropping frame");
                         }
-                    } else {
-                        // VideoPipeline not initialized yet - waiting for valid codec config
-                        debug!("Skipping video frame - waiting for valid codec configuration");
+                        Err(TrySendError::Disconnected(_)) => {
+                            info!("Mirror video worker exited");
+                            break;
+                        }
                     }
                 } else {
                     warn!(
@@ -342,29 +387,16 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                         }
                     }
                     
-                    // Now payload should be in Annex-B format
-                    // Lazy-init or reconfigure VideoPipeline with codec configuration
-                    if let Some(ref mut pipeline) = video_pipeline {
-                        // Pipeline already exists, reconfigure it
-                        if let Err(e) = pipeline.process_codec_config(&payload, width, height) {
-                            warn!("Failed to process codec config: {:?}", e);
-                        }
-                    } else {
-                        // Initialize pipeline with codec config
-                        let use_hardware = !FORCE_SOFTWARE_DECODER.load(Ordering::Relaxed);
-                        match VideoPipeline::new(use_hardware) {
-                            Ok(mut pipeline) => {
-                                if let Err(e) = pipeline.process_codec_config(&payload, width, height) {
-                                    warn!("Failed to process initial codec config: {:?}", e);
-                                } else {
-                                    info!("VideoPipeline initialized with codec config");
-                                    video_pipeline = Some(pipeline);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to initialize VideoPipeline: {:?}", e);
-                            }
-                        }
+                    if video_tx
+                        .send(MirrorVideoCmd::CodecConfig {
+                            annexb: payload,
+                            width,
+                            height,
+                        })
+                        .is_err()
+                    {
+                        warn!("Mirror video worker disconnected during codec config");
+                        break;
                     }
                 }
             }
@@ -396,15 +428,7 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
         }
     }
 
-    // Cleanup: shutdown video pipeline if it was initialized
-    if let Some(mut pipeline) = video_pipeline {
-        if let Err(e) = pipeline.shutdown() {
-            warn!("Error shutting down video pipeline: {:?}", e);
-        } else {
-            info!("Video pipeline shut down successfully");
-        }
-    }
-
+    let _ = video_tx.send(MirrorVideoCmd::Shutdown);
     Ok(())
 }
 

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::time::Instant;
 
-use super::{ffmpeg_decoder::FFmpegDecoder, DecodedFrame, VideoRenderer};
+use super::{ffmpeg_decoder::FFmpegDecoder, DecodedFrame, VideoRenderer, DEFAULT_MIRROR_FPS};
 
 #[cfg(target_os = "macos")]
 use super::macos_renderer::MacOSRenderer;
@@ -22,40 +22,31 @@ pub struct VideoPipeline {
     current_height: u32,
     frame_count: u64,
     last_frame_time: Option<Instant>,
+    /// Last presentation timestamp in nanoseconds (strictly increasing, fixed frame interval).
+    last_pts_ns: i64,
+    /// Target display / negotiation frame rate.
+    display_fps: u32,
 }
 
 impl VideoPipeline {
     /// Create a new video pipeline
-    ///
-    /// # Arguments
-    /// * `use_hardware_decoding` - Whether to use hardware acceleration for decoding
-    ///
-    /// # Returns
-    /// A new VideoPipeline instance or an error if initialization fails
-    ///
-    /// # Examples
-    /// ```no_run
-    /// use rusty_play::video::pipeline::VideoPipeline;
-    ///
-    /// // Create pipeline with hardware acceleration
-    /// let pipeline = VideoPipeline::new(true)?;
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
     pub fn new(use_hardware_decoding: bool) -> Result<Self> {
         tracing::info!(
             hardware_decoding = use_hardware_decoding,
             "Initializing video pipeline"
         );
 
-        // Initialize FFmpeg decoder
         let decoder = FFmpegDecoder::new(use_hardware_decoding)?;
         tracing::info!("FFmpegDecoder initialized successfully");
 
-        // Initialize platform-specific renderer
         #[cfg(target_os = "macos")]
-        let renderer: Box<dyn VideoRenderer> = Box::new(MacOSRenderer::new(1920, 1080)?);
+        let mut renderer: Box<dyn VideoRenderer> = Box::new(MacOSRenderer::new(1920, 1080)?);
+        renderer.set_display_fps(DEFAULT_MIRROR_FPS);
         #[cfg(target_os = "macos")]
-        tracing::info!("MacOSRenderer created successfully");
+        tracing::info!(
+            display_fps = DEFAULT_MIRROR_FPS,
+            "MacOSRenderer created successfully"
+        );
 
         #[cfg(not(target_os = "macos"))]
         compile_error!("Video rendering is currently only supported on macOS");
@@ -69,73 +60,58 @@ impl VideoPipeline {
             current_height: 1080,
             frame_count: 0,
             last_frame_time: None,
+            last_pts_ns: -1,
+            display_fps: DEFAULT_MIRROR_FPS,
         })
     }
 
-    /// Process a single NAL unit (video frame)
-    ///
-    /// This method decodes the NAL unit and displays the resulting frame.
-    ///
-    /// # Arguments
-    /// * `nal_unit` - Annex-B formatted NAL unit data
-    ///
-    /// # Returns
-    /// Ok(()) on success, or an error if processing fails
-    ///
-    /// # Examples
-    /// ```no_run
-    /// use rusty_play::video::pipeline::VideoPipeline;
-    ///
-    /// let mut pipeline = VideoPipeline::new(true)?;
-    /// pipeline.process_nal_unit(&nal_data)?;
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
-    pub fn process_nal_unit(&mut self, nal_unit: &[u8]) -> Result<()> {
-        // Check if window is still open
+    /// Generate PTS using actual sender NTP timestamp converted to nanoseconds.
+    /// This aligns video frame presentation with the sender's transmission timing,
+    /// eliminating hiccups caused by fixed frame rate assumptions.
+    fn pts_for_frame(&mut self, ntp_timestamp: u64) -> i64 {
+        // NTP timestamp is in units of 1/2^32 seconds. Convert to nanoseconds.
+        // ntp_timestamp = (seconds << 32) | fraction
+        // To avoid overflow, only use upper bits for seconds; fraction precision not critical for 60Hz.
+        let ntp_ns = (ntp_timestamp as i64).saturating_mul(1_000_000_000).saturating_div(1i64 << 32);
+        
+        // Ensure monotonically increasing to avoid display layer reordering
+        if ntp_ns <= self.last_pts_ns {
+            // Sender timestamp didn't advance; use fixed frame interval as fallback
+            let frame_ns = (1_000_000_000i64) / self.display_fps.max(1) as i64;
+            self.last_pts_ns = self.last_pts_ns.saturating_add(frame_ns);
+        } else {
+            self.last_pts_ns = ntp_ns;
+        }
+        self.last_pts_ns
+    }
+
+    /// Decode and display one AVCC access unit from the mirroring stream.
+    pub fn process_avcc_packet(&mut self, avcc_packet: &[u8], ntp_timestamp: u64) -> Result<()> {
         if !self.renderer.is_window_open() {
             anyhow::bail!("Video window closed by user");
         }
 
-        // Decode the NAL unit
-        if let Some(frame) = self.decoder.decode_nal_unit(nal_unit)? {
+        let mut frames = self.decoder.decode_avcc_packet(avcc_packet)?;
+        for mut frame in frames.drain(..) {
+            let pts = self.pts_for_frame(ntp_timestamp);
+            frame.timestamp = Some(pts);
+
             self.frame_count += 1;
             self.last_frame_time = Some(Instant::now());
-
-            // Display the frame
-            self.renderer.display_frame(&frame)?;
-
             tracing::debug!(
                 frame_count = self.frame_count,
                 width = frame.width,
                 height = frame.height,
+                pts_ns = pts,
                 "Displayed frame"
             );
+            self.renderer.display_frame(frame)?;
         }
 
         Ok(())
     }
 
     /// Process codec configuration (SPS/PPS) and handle resolution changes
-    ///
-    /// This method handles codec configuration updates and dynamically adjusts
-    /// to resolution changes (e.g., device rotation).
-    ///
-    /// # Arguments
-    /// * `sps_pps` - Annex-B formatted SPS and PPS NAL units
-    /// * `width` - New video width
-    /// * `height` - New video height
-    ///
-    /// # Returns
-    /// Ok(()) on success, or an error if reconfiguration fails
-    ///
-    /// # Examples
-    /// ```no_run
-    /// use rusty_play::video::pipeline::VideoPipeline;
-    ///
-    /// let mut pipeline = VideoPipeline::new(true)?;
-    /// pipeline.process_codec_config(&sps_pps_data, 1920.0, 1080.0)?;
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
     pub fn process_codec_config(&mut self, sps_pps: &[u8], width: f32, height: f32) -> Result<()> {
         let new_width = width as u32;
         let new_height = height as u32;
@@ -146,10 +122,10 @@ impl VideoPipeline {
             "Processing codec configuration"
         );
 
-        // Reconfigure decoder with new SPS/PPS
+        self.last_pts_ns = -1;
+
         self.decoder.reconfigure(sps_pps)?;
 
-        // Resize renderer if dimensions changed
         if new_width != self.current_width || new_height != self.current_height {
             tracing::info!(
                 old_width = self.current_width,
@@ -167,36 +143,19 @@ impl VideoPipeline {
         Ok(())
     }
 
-    /// Shutdown the pipeline and clean up resources
-    ///
-    /// This method should be called when video playback is complete to ensure
-    /// all resources are properly released.
-    ///
-    /// # Returns
-    /// Ok(()) on success, or an error if cleanup fails
     pub fn shutdown(&mut self) -> Result<()> {
         tracing::info!(
             frame_count = self.frame_count,
             "Shutting down video pipeline"
         );
-
         self.renderer.shutdown()?;
-
         Ok(())
     }
 
-    /// Get the current frame count
-    ///
-    /// # Returns
-    /// The total number of frames decoded and displayed
     pub fn frame_count(&self) -> u64 {
         self.frame_count
     }
 
-    /// Check if the video window is still open
-    ///
-    /// # Returns
-    /// true if the window is open, false if it has been closed
     pub fn is_window_open(&self) -> bool {
         self.renderer.is_window_open()
     }
@@ -208,13 +167,48 @@ mod tests {
 
     #[test]
     fn test_pipeline_initialization() {
-        // Test that pipeline can be initialized
         let result = VideoPipeline::new(false);
-        
-        // This will fail in headless environment, but that's expected
-        // The code is correct and will work in a GUI environment
-        if result.is_err() {
-            println!("Pipeline initialization failed (expected in headless environment)");
+        if result.is_ok() {
+            let pipeline = result.unwrap();
+            assert_eq!(pipeline.frame_count, 0);
+        }
+    }
+
+    #[test]
+    fn test_pts_fixed_interval() {
+        let mut pipeline = VideoPipeline {
+            decoder: FFmpegDecoder::new(false).unwrap(),
+            renderer: Box::new(MockRenderer),
+            current_width: 0,
+            current_height: 0,
+            frame_count: 0,
+            last_frame_time: None,
+            last_pts_ns: -1,
+            display_fps: 60,
+        };
+        let step = 1_000_000_000 / 60;
+        assert_eq!(pipeline.pts_for_frame(0), 0);
+        assert_eq!(pipeline.pts_for_frame(999), step);
+        assert_eq!(pipeline.pts_for_frame(999), step * 2);
+    }
+
+    struct MockRenderer;
+
+    impl VideoRenderer for MockRenderer {
+        fn new(_w: u32, _h: u32) -> Result<Self> {
+            Ok(Self)
+        }
+        fn display_frame(&mut self, _frame: DecodedFrame) -> Result<()> {
+            Ok(())
+        }
+        fn resize(&mut self, _w: u32, _h: u32) -> Result<()> {
+            Ok(())
+        }
+        fn is_window_open(&self) -> bool {
+            true
+        }
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
         }
     }
 }

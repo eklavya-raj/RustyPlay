@@ -1,0 +1,4 @@
+AirPlay Receiver for OBS
+Version: 0.1.0
+Build Date: 2026-05-31
+Platform: macOS (Apple Silicon)

@@ -122,6 +122,79 @@ pub struct SessionInfo {
     pub max_latency: Option<u32>,
 }
 
+/// Build a 24-byte ALAC `magic cookie` (ALACSpecificConfig) from SDP fmtp.
+///
+/// fmtp example: `"352 0 16 40 10 14 2 255 0 0 44100"`
+pub fn alac_magic_cookie_from_fmtp(fmtp: Option<&str>, sample_rate: u32, channels: u16) -> Vec<u8> {
+    let mut frame_len: u32 = 352;
+    let mut bit_depth: u8 = 16;
+    let mut pb: u8 = 40;
+    let mut mb: u8 = 10;
+    let mut kb: u8 = 14;
+    let mut ch: u8 = channels.min(255) as u8;
+    let mut max_run: u16 = 255;
+    let mut sr = sample_rate;
+
+    if let Some(fmtp) = fmtp {
+        let parts: Vec<&str> = fmtp.split_whitespace().collect();
+        if let Some(v) = parts.first().and_then(|s| s.parse::<u32>().ok()) {
+            frame_len = v;
+        }
+        if parts.len() >= 3 {
+            if let Ok(v) = parts[2].parse::<u8>() {
+                bit_depth = v;
+            }
+        }
+        if parts.len() >= 4 {
+            if let Ok(v) = parts[3].parse::<u8>() {
+                pb = v;
+            }
+        }
+        if parts.len() >= 5 {
+            if let Ok(v) = parts[4].parse::<u8>() {
+                mb = v;
+            }
+        }
+        if parts.len() >= 6 {
+            if let Ok(v) = parts[5].parse::<u8>() {
+                kb = v;
+            }
+        }
+        if parts.len() >= 7 {
+            if let Ok(v) = parts[6].parse::<u8>() {
+                ch = v;
+            }
+        }
+        if parts.len() >= 9 {
+            if let Ok(v) = parts[8].parse::<u16>() {
+                max_run = v;
+            }
+        }
+        if parts.len() >= 11 {
+            if let Ok(v) = parts[10].parse::<u32>() {
+                sr = v;
+            }
+        }
+    }
+
+    let fl = frame_len.to_be_bytes();
+    let sr_b = sr.to_be_bytes();
+    let mr = max_run.to_be_bytes();
+    vec![
+        fl[0], fl[1], fl[2], fl[3],
+        0x00,
+        bit_depth,
+        pb,
+        mb,
+        kb,
+        ch,
+        mr[0], mr[1],
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        sr_b[0], sr_b[1], sr_b[2], sr_b[3],
+    ]
+}
+
 impl Default for SessionInfo {
     fn default() -> Self {
         SessionInfo {
@@ -166,26 +239,30 @@ pub fn parse_sdp(body: &str) -> Result<SessionInfo> {
                     } else {
                         info.codec = AudioCodec::AacLc;
                     }
-                    if enc_parts.len() >= 2
-                        && let Ok(sr) = enc_parts[1].parse::<u32>() {
+                    if enc_parts.len() >= 2 {
+                        if let Ok(sr) = enc_parts[1].parse::<u32>() {
                             info.sample_rate = sr;
                         }
-                    if enc_parts.len() >= 3
-                        && let Ok(ch) = enc_parts[2].parse::<u16>() {
+                    }
+                    if enc_parts.len() >= 3 {
+                        if let Ok(ch) = enc_parts[2].parse::<u16>() {
                             info.channels = ch;
                         }
+                    }
                     info!(codec = %info.codec, sample_rate = info.sample_rate, channels = info.channels, "SDP: detected AAC codec");
                 } else if encoding.starts_with("L16") {
                     info.codec = AudioCodec::Pcm;
                     let enc_parts: Vec<&str> = encoding.split('/').collect();
-                    if enc_parts.len() >= 2
-                        && let Ok(sr) = enc_parts[1].parse::<u32>() {
+                    if enc_parts.len() >= 2 {
+                        if let Ok(sr) = enc_parts[1].parse::<u32>() {
                             info.sample_rate = sr;
                         }
-                    if enc_parts.len() >= 3
-                        && let Ok(ch) = enc_parts[2].parse::<u16>() {
+                    }
+                    if enc_parts.len() >= 3 {
+                        if let Ok(ch) = enc_parts[2].parse::<u16>() {
                             info.channels = ch;
                         }
+                    }
                     info!(codec = %info.codec, "SDP: detected PCM codec");
                 }
             }
@@ -204,15 +281,17 @@ pub fn parse_sdp(body: &str) -> Result<SessionInfo> {
                 //                                          ^^^^^ sample rate
                 if info.codec == AudioCodec::Alac {
                     let fmtp_parts: Vec<&str> = parts[1].split_whitespace().collect();
-                    if fmtp_parts.len() >= 11
-                        && let Ok(sr) = fmtp_parts[10].parse::<u32>() {
+                    if fmtp_parts.len() >= 11 {
+                        if let Ok(sr) = fmtp_parts[10].parse::<u32>() {
                             info.sample_rate = sr;
                         }
+                    }
                     // channels from fmtp[6]
-                    if fmtp_parts.len() >= 7
-                        && let Ok(ch) = fmtp_parts[6].parse::<u16>() {
+                    if fmtp_parts.len() >= 7 {
+                        if let Ok(ch) = fmtp_parts[6].parse::<u16>() {
                             info.channels = ch;
                         }
+                    }
                 }
             }
         }
@@ -248,18 +327,20 @@ pub fn parse_sdp(body: &str) -> Result<SessionInfo> {
         }
 
         // Parse min-latency
-        if let Some(val_str) = line.strip_prefix("a=min-latency:")
-            && let Ok(val) = val_str.trim().parse::<u32>() {
+        if let Some(val_str) = line.strip_prefix("a=min-latency:") {
+            if let Ok(val) = val_str.trim().parse::<u32>() {
                 info.min_latency = Some(val);
                 info!(min_latency = val, "SDP: min latency");
             }
+        }
 
         // Parse max-latency
-        if let Some(val_str) = line.strip_prefix("a=max-latency:")
-            && let Ok(val) = val_str.trim().parse::<u32>() {
+        if let Some(val_str) = line.strip_prefix("a=max-latency:") {
+            if let Ok(val) = val_str.trim().parse::<u32>() {
                 info.max_latency = Some(val);
                 info!(max_latency = val, "SDP: max latency");
             }
+        }
     }
 
     Ok(info)

@@ -16,8 +16,11 @@ use dispatch;
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
+use core_foundation::base::kCFAllocatorDefault;
+
+use super::{DEFAULT_MIRROR_FPS, VIDEO_PTS_TIMESCALE};
 use std::thread;
 
 use super::{DecodedFrame, PixelFormat, VideoRenderer};
@@ -29,6 +32,9 @@ static START_EVENT_LOOP: Once = Once::new();
 ///
 /// This renderer uses native macOS APIs to display decoded video frames
 /// in a native NSWindow with hardware acceleration.
+/// Max frames awaiting main-thread enqueue (drop only under heavy backlog).
+const MAX_DISPLAY_IN_FLIGHT: usize = 8;
+
 pub struct MacOSRenderer {
     window: id,
     display_layer: id,
@@ -36,6 +42,9 @@ pub struct MacOSRenderer {
     width: u32,
     height: u32,
     window_open: Arc<AtomicBool>,
+    display_fps: u32,
+    in_flight: Arc<AtomicUsize>,
+    timebase_started: Arc<AtomicBool>,
 }
 
 // Safety: NSWindow and AVSampleBufferDisplayLayer are thread-safe for our use case
@@ -136,7 +145,7 @@ impl VideoRenderer for MacOSRenderer {
                     
                     // Configure display layer for video content
                     let _: () = msg_send![display_layer, setVideoGravity: NSString::alloc(nil).init_str("AVLayerVideoGravityResizeAspect")];
-                    
+
                     // Send the window and display_layer back as raw pointers (usize)
                     let _ = tx.send(Ok((window as usize, display_layer as usize)));
                 }
@@ -168,78 +177,57 @@ impl VideoRenderer for MacOSRenderer {
                 width,
                 height,
                 window_open,
+                display_fps: DEFAULT_MIRROR_FPS,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                timebase_started: Arc::new(AtomicBool::new(false)),
             })
         }
     }
-    
-    fn display_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
-        unsafe {
-            // Copy frame data for dispatch (Vec<u8> is Send)
-            let frame_data = frame.data.clone();
-            let frame_width = frame.width;
-            let frame_height = frame.height;
-            let frame_format = frame.format;
-            let frame_ts = frame.timestamp;
-            
-            // Move ALL CoreMedia + CoreAnimation work to the main thread.
-            // This includes CVPixelBuffer creation, CMSampleBuffer, enqueue, and cleanup.
-            let display_layer_ptr = self.display_layer as usize;
 
-            use std::sync::mpsc;
-            let (tx, rx) = mpsc::channel();
+    fn set_display_fps(&mut self, fps: u32) {
+        self.display_fps = fps.max(1);
+        tracing::info!(display_fps = self.display_fps, "Video display frame rate updated");
+    }
+
+    fn display_frame(&mut self, frame: DecodedFrame) -> Result<()> {
+        if self.in_flight.load(Ordering::Acquire) >= MAX_DISPLAY_IN_FLIGHT {
+            tracing::trace!("Dropping video frame — main-thread backlog");
+            return Ok(());
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+
+        unsafe {
+            let display_layer_ptr = self.display_layer as usize;
+            let display_fps = self.display_fps;
+            let in_flight = self.in_flight.clone();
+            let timebase_started = self.timebase_started.clone();
 
             dispatch::Queue::main().exec_async(move || {
                 unsafe {
                     let display_layer = display_layer_ptr as id;
-                    
-                    // Build a temporary DecodedFrame on the main thread
-                    let main_frame = DecodedFrame {
-                        data: frame_data,
-                        width: frame_width,
-                        height: frame_height,
-                        format: frame_format,
-                        timestamp: frame_ts,
-                    };
-                    
-                    // Create CVPixelBuffer from decoded frame data
-                    let pixel_buffer = match create_pixel_buffer_from_frame_on_main(&main_frame) {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            tracing::warn!("Failed to create pixel buffer: {:?}", e);
-                            let _ = tx.send(());
-                            return;
-                        }
-                    };
+                    if !timebase_started.swap(true, Ordering::AcqRel) {
+                        ensure_host_timebase(display_layer);
+                    }
 
-                    // Create CMSampleBuffer from the pixel buffer.
-                    let sample_buffer = match create_sample_buffer_on_main(pixel_buffer, frame_ts) {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            tracing::warn!("Failed to create sample buffer: {:?}", e);
-                            CVPixelBufferRelease(pixel_buffer);
-                            let _ = tx.send(());
-                            return;
-                        }
-                    };
+                    let result = (|| -> Result<()> {
+                        let pixel_buffer = create_pixel_buffer_from_frame_on_main(&frame)?;
+                        let sample_buffer =
+                            create_sample_buffer_on_main(pixel_buffer, frame.timestamp, display_fps)?;
+                        let _: () = msg_send![display_layer, enqueueSampleBuffer: sample_buffer];
+                        unsafe { CFRelease(sample_buffer as CFTypeRef) };
+                        unsafe { CVPixelBufferRelease(pixel_buffer) };
+                        Ok(())
+                    })();
 
-                    // Enqueue sample buffer to display layer on the main thread.
-                    let _: () = msg_send![display_layer, enqueueSampleBuffer: sample_buffer];
-                    
-                    // Force display to update immediately
-                    let _: () = msg_send![display_layer, display];
-
-                    // Release resources after enqueue.
-                    CFRelease(sample_buffer as CFTypeRef);
-                    CVPixelBufferRelease(pixel_buffer);
+                    if let Err(e) = result {
+                        tracing::warn!("Failed to display frame on main thread: {:?}", e);
+                    }
                 }
-                let _ = tx.send(());
+                in_flight.fetch_sub(1, Ordering::Release);
             });
-
-            // Wait for the main-thread operation to complete
-            rx.recv().ok();
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     
@@ -394,12 +382,14 @@ impl MacOSRenderer {
         pixel_attrs.set(height_key, height_value);
         
         let mut pool: CVPixelBufferPoolRef = ptr::null_mut();
-        let status = CVPixelBufferPoolCreate(
-            kCFAllocatorDefault,
-            ptr::null(),
-            pixel_attrs.as_concrete_TypeRef() as *const _,
-            &mut pool,
-        );
+        let status = unsafe {
+            CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                ptr::null(),
+                pixel_attrs.as_concrete_TypeRef() as *const _,
+                &mut pool,
+            )
+        };
         
         if status != kCVReturnSuccess {
             anyhow::bail!("Failed to create CVPixelBufferPool: {}", status);
@@ -426,21 +416,23 @@ impl MacOSRenderer {
             PixelFormat::NV12 => {
                 // NV12 format: Y plane followed by interleaved UV plane
                 // This is the preferred format for VideoToolbox
-                let status = CVPixelBufferCreate(
-                    kCFAllocatorDefault,
-                    frame.width as usize,
-                    frame.height as usize,
-                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                    ptr::null(),
-                    &mut pixel_buffer,
-                );
+                let status = unsafe {
+                    CVPixelBufferCreate(
+                        kCFAllocatorDefault,
+                        frame.width as usize,
+                        frame.height as usize,
+                        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                        ptr::null(),
+                        &mut pixel_buffer,
+                    )
+                };
                 
                 if status != kCVReturnSuccess {
                     anyhow::bail!("Failed to create CVPixelBuffer: {}", status);
                 }
                 
                 // Lock the pixel buffer for writing
-                CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+                unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
                 
                 // Copy Y plane
                 let y_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
@@ -479,21 +471,23 @@ impl MacOSRenderer {
             PixelFormat::YUV420P => {
                 // YUV420P format: Y plane, U plane, V plane (planar)
                 // Need to convert to NV12 (Y plane, interleaved UV plane)
-                let status = CVPixelBufferCreate(
-                    kCFAllocatorDefault,
-                    frame.width as usize,
-                    frame.height as usize,
-                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                    ptr::null(),
-                    &mut pixel_buffer,
-                );
+                let status = unsafe {
+                    CVPixelBufferCreate(
+                        kCFAllocatorDefault,
+                        frame.width as usize,
+                        frame.height as usize,
+                        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                        ptr::null(),
+                        &mut pixel_buffer,
+                    )
+                };
                 
                 if status != kCVReturnSuccess {
                     anyhow::bail!("Failed to create CVPixelBuffer: {}", status);
                 }
                 
                 // Lock the pixel buffer for writing
-                CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+                unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
                 
                 // Copy Y plane
                 let y_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
@@ -569,7 +563,7 @@ impl MacOSRenderer {
         
         // Create timing info
         let time_value = timestamp.unwrap_or(0);
-        let timescale = 1_000_000_000; // nanoseconds
+        let timescale = 30i32; // nanoseconds
         
         let timing = CMSampleTimingInfo {
             duration: CMTime {
@@ -594,11 +588,13 @@ impl MacOSRenderer {
         
         // Get video format description from pixel buffer
         let mut format_description: *mut c_void = ptr::null_mut();
-        let status = CMVideoFormatDescriptionCreateForImageBuffer(
-            kCFAllocatorDefault,
-            pixel_buffer,
-            &mut format_description,
-        );
+        let status = unsafe {
+            CMVideoFormatDescriptionCreateForImageBuffer(
+                kCFAllocatorDefault,
+                pixel_buffer,
+                &mut format_description,
+            )
+        };
         
         if status != 0 {
             anyhow::bail!("Failed to create CMVideoFormatDescription: {}", status);
@@ -606,16 +602,18 @@ impl MacOSRenderer {
         
         // Create sample buffer
         let mut sample_buffer: *mut c_void = ptr::null_mut();
-        let status = CMSampleBufferCreateReadyWithImageBuffer(
-            kCFAllocatorDefault,
-            pixel_buffer,
-            format_description,
-            &timing as *const _ as *const c_void,
-            &mut sample_buffer,
-        );
+        let status = unsafe {
+            CMSampleBufferCreateReadyWithImageBuffer(
+                kCFAllocatorDefault,
+                pixel_buffer,
+                format_description,
+                &timing as *const _ as *const c_void,
+                &mut sample_buffer,
+            )
+        };
         
         // Release format description
-        CFRelease(format_description as CFTypeRef);
+        unsafe { CFRelease(format_description as CFTypeRef) };
         
         if status != 0 {
             anyhow::bail!("Failed to create CMSampleBuffer: {}", status);
@@ -635,19 +633,21 @@ unsafe fn create_pixel_buffer_from_frame_on_main(frame: &DecodedFrame) -> Result
     
     match frame.format {
         PixelFormat::NV12 => {
-            let status = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                width, height,
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                ptr::null(),
-                &mut pixel_buffer,
-            );
+            let status = unsafe {
+                CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    width, height,
+                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                    ptr::null(),
+                    &mut pixel_buffer,
+                )
+            };
             
             if status != kCVReturnSuccess {
                 anyhow::bail!("Failed to create CVPixelBuffer: {}", status);
             }
             
-            CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+            unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
             
             // Copy Y plane
             let y_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
@@ -682,19 +682,21 @@ unsafe fn create_pixel_buffer_from_frame_on_main(frame: &DecodedFrame) -> Result
         
         PixelFormat::YUV420P => {
             // Create NV12 pixel buffer (preferred by CoreVideo)
-            let status = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                width, height,
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                ptr::null(),
-                &mut pixel_buffer,
-            );
+            let status = unsafe {
+                CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    width, height,
+                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                    ptr::null(),
+                    &mut pixel_buffer,
+                )
+            };
             
             if status != kCVReturnSuccess {
                 anyhow::bail!("Failed to create CVPixelBuffer: {}", status);
             }
             
-            CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+            unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
             
             // Copy Y plane (same for both formats)
             let y_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
@@ -742,6 +744,7 @@ unsafe fn create_pixel_buffer_from_frame_on_main(frame: &DecodedFrame) -> Result
 unsafe fn create_sample_buffer_on_main(
     pixel_buffer: CVPixelBufferRef,
     timestamp: Option<i64>,
+    display_fps: u32,
 ) -> Result<*mut c_void> {
     use core_foundation::base::kCFAllocatorDefault;
     
@@ -761,35 +764,55 @@ unsafe fn create_sample_buffer_on_main(
     }
     
     let time_value = timestamp.unwrap_or(0);
-    let timescale = 1_000_000_000;
-    
+    let timescale = VIDEO_PTS_TIMESCALE;
+    let frame_duration_ns = 1_000_000_000i64 / display_fps.max(1) as i64;
+
     let timing = CMSampleTimingInfo {
-        duration: CMTime { value: 0, timescale, flags: 1, epoch: 0 },
-        presentation_time_stamp: CMTime { value: time_value, timescale, flags: 1, epoch: 0 },
-        decode_time_stamp: CMTime { value: time_value, timescale, flags: 1, epoch: 0 },
+        duration: CMTime {
+            value: frame_duration_ns,
+            timescale,
+            flags: 1,
+            epoch: 0,
+        },
+        presentation_time_stamp: CMTime {
+            value: time_value,
+            timescale,
+            flags: 1,
+            epoch: 0,
+        },
+        decode_time_stamp: CMTime {
+            value: time_value,
+            timescale,
+            flags: 1,
+            epoch: 0,
+        },
     };
     
     let mut format_description: *mut c_void = ptr::null_mut();
-    let status = CMVideoFormatDescriptionCreateForImageBuffer(
-        kCFAllocatorDefault,
-        pixel_buffer,
-        &mut format_description,
-    );
+    let status = unsafe {
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            kCFAllocatorDefault,
+            pixel_buffer,
+            &mut format_description,
+        )
+    };
     
     if status != 0 {
         anyhow::bail!("Failed to create CMVideoFormatDescription: {}", status);
     }
     
     let mut sample_buffer: *mut c_void = ptr::null_mut();
-    let status = CMSampleBufferCreateReadyWithImageBuffer(
-        kCFAllocatorDefault,
-        pixel_buffer,
-        format_description,
-        &timing as *const _ as *const c_void,
-        &mut sample_buffer,
-    );
+    let status = unsafe {
+        CMSampleBufferCreateReadyWithImageBuffer(
+            kCFAllocatorDefault,
+            pixel_buffer,
+            format_description,
+            &timing as *const _ as *const c_void,
+            &mut sample_buffer,
+        )
+    };
     
-    CFRelease(format_description as CFTypeRef);
+    unsafe { CFRelease(format_description as CFTypeRef) };
     
     if status != 0 {
         anyhow::bail!("Failed to create CMSampleBuffer: {}", status);
@@ -798,9 +821,43 @@ unsafe fn create_sample_buffer_on_main(
     Ok(sample_buffer)
 }
 
+#[repr(C)]
+struct CMTime {
+    value: i64,
+    timescale: i32,
+    flags: u32,
+    epoch: i64,
+}
+
+/// Bind ASBDL to the host clock once (live mirroring).
+unsafe fn ensure_host_timebase(display_layer: id) {
+    let mut timebase: *mut c_void = ptr::null_mut();
+    let host_clock = unsafe { CMClockGetHostTimeClock() };
+    if host_clock.is_null() {
+        return;
+    }
+    if unsafe { CMTimebaseCreateWithMasterClock(kCFAllocatorDefault, host_clock, &mut timebase) } != 0 {
+        return;
+    }
+    let now = unsafe { CMClockGetTime(host_clock) };
+    unsafe { CMTimebaseSetTime(timebase, now) };
+    unsafe { CMTimebaseSetRate(timebase, 1.0) };
+    let _: () = msg_send![display_layer, setControlTimebase: timebase];
+}
+
 // External Core Media functions
 #[link(name = "CoreMedia", kind = "framework")]
 unsafe extern "C" {
+    fn CMClockGetHostTimeClock() -> *mut c_void;
+    fn CMClockGetTime(clock: *mut c_void) -> CMTime;
+    fn CMTimebaseCreateWithMasterClock(
+        allocator: *const c_void,
+        master_clock: *mut c_void,
+        timebase_out: *mut *mut c_void,
+    ) -> i32;
+    fn CMTimebaseSetTime(timebase: *mut c_void, time: CMTime) -> i32;
+    fn CMTimebaseSetRate(timebase: *mut c_void, rate: f64) -> i32;
+
     fn CMVideoFormatDescriptionCreateForImageBuffer(
         allocator: *const c_void,
         image_buffer: CVPixelBufferRef,

@@ -6,6 +6,12 @@
 
 use anyhow::Result;
 
+/// Target display rate for AirPlay screen mirroring (iPhone often sends up to 60 Hz).
+pub const DEFAULT_MIRROR_FPS: u32 = 60;
+
+/// CMTime timescale for mirror PTS (nanoseconds — matches UxPlay `video_renderer_render_buffer`).
+pub const VIDEO_PTS_TIMESCALE: i32 = 1_000_000_000;
+
 /// Represents a decoded video frame ready for display
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
@@ -62,7 +68,7 @@ impl Default for VideoConfig {
         Self {
             width: 1920,
             height: 1080,
-            frame_rate: 30.0,
+            frame_rate: 60.0,
             use_hardware: true,
         }
     }
@@ -93,8 +99,11 @@ pub trait VideoRenderer: Send {
     ///
     /// # Returns
     /// Ok(()) on success, or an error if frame presentation fails
-    fn display_frame(&mut self, frame: &DecodedFrame) -> Result<()>;
-    
+    fn display_frame(&mut self, frame: DecodedFrame) -> Result<()>;
+
+    /// Set expected stream/display frame rate (drives CMTime spacing on macOS).
+    fn set_display_fps(&mut self, _fps: u32) {}
+
     /// Resize the display window
     ///
     /// # Arguments

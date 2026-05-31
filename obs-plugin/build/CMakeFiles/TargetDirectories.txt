@@ -1,0 +1,7 @@
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/obs-airplay.dir
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/edit_cache.dir
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/rebuild_cache.dir
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/list_install_components.dir
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/install.dir
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/install/local.dir
+/Users/eklavya/Desktop/ux-play-rust/obs-plugin/build/CMakeFiles/install/strip.dir

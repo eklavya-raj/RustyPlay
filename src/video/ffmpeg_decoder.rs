@@ -23,6 +23,8 @@ pub struct FFmpegDecoder {
     use_hardware: bool,
     frame_count: u64,
     codec: ffmpeg::Codec,
+    /// Reused across `receive_frame` calls (avoids per-frame allocation).
+    decode_frame: ffmpeg::frame::Video,
 }
 
 // Safety: ffmpeg::decoder::Video is Send (it wraps AVCodecContext which is just a pointer)
@@ -69,6 +71,7 @@ impl FFmpegDecoder {
             use_hardware: actual_use_hardware,
             frame_count: 0,
             codec,
+            decode_frame: ffmpeg::frame::Video::empty(),
         })
     }
 
@@ -138,122 +141,120 @@ impl FFmpegDecoder {
         }
     }
 
-    /// Decode a single Annex-B formatted NAL unit
-    pub fn decode_nal_unit(&mut self, nal_unit: &[u8]) -> Result<Option<DecodedFrame>> {
-        if nal_unit.is_empty() {
-            warn!("Received empty NAL unit, skipping");
-            return Ok(None);
+    /// Decode one AVCC access unit (4-byte big-endian length-prefixed NALs).
+    ///
+    /// The decoder must be configured with avcC extradata (via `reconfigure`) before
+    /// this is called for mirroring streams.
+    pub fn decode_avcc_packet(&mut self, avcc_data: &[u8]) -> Result<Vec<DecodedFrame>> {
+        if avcc_data.is_empty() {
+            warn!("Received empty AVCC packet, skipping");
+            return Ok(Vec::new());
         }
 
-        // Auto-open decoder on first use (no extradata needed for frames)
         if self.video.is_none() {
             unsafe { self.open_video_decoder(None)?; }
         }
 
         let video = self.video.as_mut().unwrap();
 
-        // Create a packet from the NAL unit data
-        let mut packet = ffmpeg::Packet::new(nal_unit.len());
+        let mut packet = ffmpeg::Packet::new(avcc_data.len());
         if let Some(data) = packet.data_mut() {
-            data.copy_from_slice(nal_unit);
+            data.copy_from_slice(avcc_data);
         } else {
             return Err(anyhow::anyhow!("Failed to allocate packet data"));
         }
 
-        // Send packet to decoder
         if let Err(e) = video.send_packet(&packet) {
-            warn!(error = ?e, nal_size = nal_unit.len(), "Failed to send packet to decoder");
-            // Don't bail - the decoder might still produce a buffered frame
+            warn!(error = ?e, packet_size = avcc_data.len(), "Failed to send packet to decoder");
         }
 
-        // Try to receive a decoded frame
-        let mut frame = ffmpeg::frame::Video::empty();
-        match video.receive_frame(&mut frame) {
-            Ok(()) => {
-                self.frame_count += 1;
-
-                let width = frame.width();
-                let height = frame.height();
-                let format = Self::pixel_format_from_ffmpeg(frame.format());
-
-                let mut data = Vec::new();
-                let uv_width = (width / 2) as usize;
-                let uv_height = (height / 2) as usize;
-
-                // Copy Y plane
-                let y_stride = frame.stride(0) as usize;
-                for row in 0..height as usize {
-                    let src = frame.data(0);
-                    let start = row * y_stride;
-                    let end = start + width as usize;
-                    if end <= src.len() {
-                        data.extend_from_slice(&src[start..end]);
+        let mut decoded = Vec::with_capacity(2);
+        loop {
+            match video.receive_frame(&mut self.decode_frame) {
+                Ok(()) => {
+                    self.frame_count += 1;
+                    if let Some(decoded_frame) = Self::frame_to_decoded(&self.decode_frame) {
+                        decoded.push(decoded_frame);
                     }
                 }
-
-                // Copy chroma planes
-                if format == PixelFormat::YUV420P || format == PixelFormat::NV12 {
-                    // Plane 1 (U for YUV420P, UV for NV12)
-                    let uv_stride = frame.stride(1) as usize;
-                    let uv_data = frame.data(1);
-                    let chroma_row_size = if format == PixelFormat::NV12 {
-                        uv_width * 2
-                    } else {
-                        uv_width
-                    };
-                    for row in 0..uv_height {
-                        let start = row * uv_stride;
-                        let end = start + chroma_row_size;
-                        if end <= uv_data.len() {
-                            data.extend_from_slice(&uv_data[start..end]);
-                        }
-                    }
-
-                    // V plane (only for YUV420P)
-                    if format == PixelFormat::YUV420P {
-                        let v_stride = frame.stride(2) as usize;
-                        let v_data = frame.data(2);
-                        for row in 0..uv_height {
-                            let start = row * v_stride;
-                            let end = start + uv_width;
-                            if end <= v_data.len() {
-                                data.extend_from_slice(&v_data[start..end]);
-                            }
-                        }
-                    }
+                Err(ffmpeg::Error::Other { errno }) if errno == 35 /* EAGAIN */ => break,
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => {
+                    warn!(error = ?e, "FFmpeg decoding error");
+                    return Err(anyhow::anyhow!("Decoding error: {:?}", e));
                 }
-
-                let decoded_frame = DecodedFrame {
-                    data,
-                    width,
-                    height,
-                    format,
-                    timestamp: frame.timestamp(),
-                };
-
-                debug!(
-                    frame_count = self.frame_count,
-                    width = width,
-                    height = height,
-                    format = ?format,
-                    "Decoded frame"
-                );
-
-                Ok(Some(decoded_frame))
-            }
-            Err(ffmpeg::Error::Other { errno }) if errno == 35 /* EAGAIN */ => {
-                debug!("Decoder needs more data (EAGAIN)");
-                Ok(None)
-            }
-            Err(ffmpeg::Error::Eof) => {
-                debug!("Decoder EOF");
-                Ok(None)
-            }
-            Err(e) => {
-                warn!(error = ?e, "FFmpeg decoding error");
-                Err(anyhow::anyhow!("Decoding error: {:?}", e))
             }
         }
+
+        Ok(decoded)
+    }
+
+    fn frame_to_decoded(frame: &ffmpeg::frame::Video) -> Option<DecodedFrame> {
+        let width = frame.width();
+        let height = frame.height();
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let format = Self::pixel_format_from_ffmpeg(frame.format());
+        let w = width as usize;
+        let h = height as usize;
+        let uv_width = w / 2;
+        let uv_height = h / 2;
+        let y_size = w * h;
+        let chroma_size = if format == PixelFormat::NV12 {
+            uv_width * uv_height * 2
+        } else {
+            uv_width * uv_height * 2
+        };
+        let mut data = Vec::with_capacity(y_size + chroma_size);
+
+        let y_stride = frame.stride(0) as usize;
+        let y_plane = frame.data(0);
+        for row in 0..h {
+            let start = row * y_stride;
+            let end = start + w;
+            if end <= y_plane.len() {
+                data.extend_from_slice(&y_plane[start..end]);
+            }
+        }
+
+        if format == PixelFormat::YUV420P || format == PixelFormat::NV12 {
+            let uv_stride = frame.stride(1) as usize;
+            let uv_data = frame.data(1);
+            let chroma_row_size = if format == PixelFormat::NV12 {
+                uv_width * 2
+            } else {
+                uv_width
+            };
+            for row in 0..uv_height {
+                let start = row * uv_stride;
+                let end = start + chroma_row_size;
+                if end <= uv_data.len() {
+                    data.extend_from_slice(&uv_data[start..end]);
+                }
+            }
+
+            if format == PixelFormat::YUV420P {
+                let v_stride = frame.stride(2) as usize;
+                let v_data = frame.data(2);
+                for row in 0..uv_height {
+                    let start = row * v_stride;
+                    let end = start + uv_width;
+                    if end <= v_data.len() {
+                        data.extend_from_slice(&v_data[start..end]);
+                    }
+                }
+            }
+        }
+
+        Some(DecodedFrame {
+            data,
+            width,
+            height,
+            format,
+            timestamp: frame.timestamp(),
+        })
     }
 
     fn pixel_format_from_ffmpeg(pix: ffmpeg::format::Pixel) -> PixelFormat {
@@ -399,44 +400,10 @@ impl FFmpegDecoder {
         let mut frames = Vec::new();
         let mut frame = ffmpeg::frame::Video::empty();
         while video.receive_frame(&mut frame).is_ok() {
-            let width = frame.width();
-            let height = frame.height();
-            let format = Self::pixel_format_from_ffmpeg(frame.format());
-
-            let mut data = Vec::new();
-            let uv_width = (width / 2) as usize;
-            let uv_height = (height / 2) as usize;
-
-            let y_stride = frame.stride(0) as usize;
-            for row in 0..height as usize {
-                let src = frame.data(0);
-                let start = row * y_stride;
-                let end = start + width as usize;
-                if end <= src.len() {
-                    data.extend_from_slice(&src[start..end]);
-                }
+            if let Some(decoded_frame) = Self::frame_to_decoded(&frame) {
+                frames.push(decoded_frame);
             }
-
-            if format == PixelFormat::YUV420P || format == PixelFormat::NV12 {
-                let uv_stride = frame.stride(1) as usize;
-                let uv_data = frame.data(1);
-                let chroma_row_size = if format == PixelFormat::NV12 { uv_width * 2 } else { uv_width };
-                for row in 0..uv_height {
-                    let start = row * uv_stride;
-                    let end = start + chroma_row_size;
-                    if end <= uv_data.len() {
-                        data.extend_from_slice(&uv_data[start..end]);
-                    }
-                }
-            }
-
-            frames.push(DecodedFrame {
-                data,
-                width,
-                height,
-                format,
-                timestamp: frame.timestamp(),
-            });
+            frame = ffmpeg::frame::Video::empty();
         }
 
         info!(flushed = frames.len(), "Flush complete");
@@ -470,11 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_empty_nal_unit() {
+    fn test_decode_empty_avcc_packet() {
         let mut d = FFmpegDecoder::new(false).unwrap();
-        let r = d.decode_nal_unit(&[]);
+        let r = d.decode_avcc_packet(&[]);
         assert!(r.is_ok());
-        assert!(r.unwrap().is_none());
+        assert!(r.unwrap().is_empty());
     }
 
     #[test]

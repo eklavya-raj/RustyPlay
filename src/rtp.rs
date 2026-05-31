@@ -1,8 +1,10 @@
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
+
+use crate::ntp::{ClockSync, NtpTimestamp};
 
 /// Parsed RTP packet with header fields and payload
 #[derive(Debug, Clone)]
@@ -31,6 +33,8 @@ pub struct JitterBuffer {
     total_received: u64,
     total_dropped: u64,
     total_duplicates: u64,
+    /// Incremented on each `flush()` so the audio pipeline can re-prefill.
+    flush_generation: u64,
 }
 
 impl JitterBuffer {
@@ -38,57 +42,100 @@ impl JitterBuffer {
         JitterBuffer {
             buffer: VecDeque::with_capacity(max_size),
             max_size,
-            min_fill: max_size / 4, // 25% fill before playout starts
+            // ~500 ms prefill at 352 samples / 44.1 kHz (≈ 30 frames).
+            // Increased from 12 to absorb wider packet reordering gaps and prevent underruns.
+            min_fill: 30,
             expected_seq: None,
             total_received: 0,
             total_dropped: 0,
             total_duplicates: 0,
+            flush_generation: 0,
         }
+    }
+
+    /// Generation counter bumped on every flush (RECORD / FLUSH / TEARDOWN).
+    pub fn flush_generation(&self) -> u64 {
+        self.flush_generation
     }
 
     /// Insert a packet in sequence order, handling u16 wrap-around.
     pub fn insert(&mut self, packet: RtpPacket) {
         self.total_received += 1;
 
-        // Set initial expected sequence
-        if self.expected_seq.is_none() {
-            self.expected_seq = Some(packet.sequence);
+        while self.buffer.len() >= self.max_size {
+            if let Some(evicted) = self.buffer.pop_front() {
+                self.total_dropped += 1;
+                if self.expected_seq == Some(evicted.sequence) {
+                    self.expected_seq = self.buffer.front().map(|p| p.sequence);
+                }
+            } else {
+                break;
+            }
         }
 
-        // Find insertion position using wrapping comparison
-        let pos = self.buffer.binary_search_by(|p| {
-            seq_compare(p.sequence, packet.sequence)
-        });
-
-        match pos {
-            Ok(_) => {
-                // Duplicate packet
+        // Fast path: most packets arrive in order (O(1) vs O(log n) binary search).
+        if let Some(back) = self.buffer.back() {
+            if packet.sequence == back.sequence {
                 self.total_duplicates += 1;
-                debug!(seq = packet.sequence, "Duplicate RTP packet, ignoring");
+                return;
             }
-            Err(idx) => {
-                if self.buffer.len() < self.max_size {
-                    debug!(
-                        seq = packet.sequence,
-                        pos = idx,
-                        buf_len = self.buffer.len(),
-                        "Inserted RTP packet"
-                    );
-                    self.buffer.insert(idx, packet);
-                } else {
-                    self.total_dropped += 1;
-                    warn!(
-                        seq = packet.sequence,
-                        dropped = self.total_dropped,
-                        "Jitter buffer full, dropping packet"
-                    );
-                }
+            if seq_compare(packet.sequence, back.sequence) == std::cmp::Ordering::Greater {
+                self.buffer.push_back(packet);
+                return;
             }
+        } else {
+            self.buffer.push_back(packet);
+            return;
+        }
+
+        let pos = self.buffer.binary_search_by(|p| seq_compare(p.sequence, packet.sequence));
+        match pos {
+            Ok(_) => self.total_duplicates += 1,
+            Err(idx) => self.buffer.insert(idx, packet),
         }
     }
 
-    /// Pop the next packet from the front of the buffer.
-    pub fn pop(&mut self) -> Option<RtpPacket> {
+    /// Align playout sequence to the lowest packet currently buffered.
+    pub fn sync_expected_to_front(&mut self) {
+        if let Some(pkt) = self.buffer.front() {
+            self.expected_seq = Some(pkt.sequence);
+        }
+    }
+
+    /// RTP timestamp of the next packet to play (if any).
+    pub fn front_rtp_timestamp(&self) -> Option<u32> {
+        self.buffer.front().map(|p| p.timestamp)
+    }
+
+    /// Pop the next in-order packet (uxplay-style), waiting on gaps when possible.
+    pub fn pop_next(&mut self) -> Option<RtpPacket> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        let expected = match self.expected_seq {
+            Some(seq) => seq,
+            None => {
+                self.sync_expected_to_front();
+                self.expected_seq?
+            }
+        };
+
+        let front_seq = self.buffer.front()?.sequence;
+        if front_seq != expected {
+            // Gap — wait briefly for retransmit; skip if the buffer is backing up.
+            if self.buffer.len() < self.max_size / 2 {
+                return None;
+            }
+            debug!(
+                expected = expected,
+                front = front_seq,
+                buf_len = self.buffer.len(),
+                "RTP sequence gap — skipping to next available packet"
+            );
+            self.expected_seq = Some(front_seq);
+        }
+
         let pkt = self.buffer.pop_front()?;
         self.expected_seq = Some(pkt.sequence.wrapping_add(1));
         Some(pkt)
@@ -97,6 +144,11 @@ impl JitterBuffer {
     /// Check if the buffer has enough packets to start playout.
     pub fn is_ready(&self) -> bool {
         self.buffer.len() >= self.min_fill
+    }
+
+    /// Minimum packets required before playout starts.
+    pub fn min_fill(&self) -> usize {
+        self.min_fill
     }
 
     /// Current number of packets in the buffer.
@@ -113,6 +165,7 @@ impl JitterBuffer {
     pub fn flush(&mut self) {
         self.buffer.clear();
         self.expected_seq = None;
+        self.flush_generation = self.flush_generation.wrapping_add(1);
         info!(
             received = self.total_received,
             dropped = self.total_dropped,
@@ -132,6 +185,7 @@ impl JitterBuffer {
 /// Returns Ordering based on the "shorter distance" around the u16 ring.
 /// This handles the 65535→0 wrap-around correctly for sequences within
 /// a window of ~32768 of each other.
+#[inline]
 fn seq_compare(a: u16, b: u16) -> std::cmp::Ordering {
     let diff = a.wrapping_sub(b) as i16;
     diff.cmp(&0)
@@ -190,15 +244,6 @@ pub fn parse_rtp_packet(data: &[u8]) -> Option<RtpPacket> {
 
     let payload = data[header_size..payload_end].to_vec();
 
-    debug!(
-        seq = sequence,
-        ts = timestamp,
-        pt = payload_type,
-        marker = marker,
-        payload_len = payload.len(),
-        "RTP packet parsed"
-    );
-
     Some(RtpPacket {
         version,
         padding,
@@ -232,13 +277,6 @@ pub async fn start_rtp_receiver(
                     let mut buffer = jitter_buffer.lock().unwrap();
                     buffer.insert(packet);
 
-                    if buffer.len().is_multiple_of(100) {
-                        debug!(
-                            buf_len = buffer.len(),
-                            peer = %src,
-                            "Jitter buffer status"
-                        );
-                    }
                 }
             }
             Err(e) => {
@@ -250,8 +288,27 @@ pub async fn start_rtp_receiver(
 
 /// Start the RTP control receiver on the specified port.
 ///
+/// RTP control SYNC payload type (Airtunes2: 0x54).
+const PAYLOAD_SYNC: u8 = 0x54;
+
+/// Parse a 20-byte RTP control SYNC packet from the sender.
+fn parse_sync_packet(data: &[u8]) -> Option<(u32, u32, NtpTimestamp, bool)> {
+    if data.len() < 20 {
+        return None;
+    }
+    let pt = data[1] & 0x7F;
+    if pt != PAYLOAD_SYNC {
+        return None;
+    }
+    let first_after_flush = (data[0] & 0x10) != 0;
+    let rtp_now_minus_latency = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let remote_ntp = NtpTimestamp::from_bytes(&data[8..16])?;
+    let rtp_now = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+    Some((rtp_now_minus_latency, rtp_now, remote_ntp, first_after_flush))
+}
+
 /// Handles RTCP-like control packets (retransmission requests, sync, etc.)
-pub async fn start_rtp_control(port: u16) -> Result<()> {
+pub async fn start_rtp_control(port: u16, clock_sync: Arc<RwLock<ClockSync>>) -> Result<()> {
     let addr = format!("[::]:{}", port);
     let socket = UdpSocket::bind(&addr).await?;
     info!(port = port, "RTP control receiver started");
@@ -284,11 +341,17 @@ pub async fn start_rtp_control(port: u16) -> Result<()> {
                         debug!("Retransmit response from client");
                         // TODO: extract the embedded RTP packet and insert into jitter buffer
                     }
-                    // Sync packet (type 84)
-                    84 => {
-                        debug!("Sync packet received");
-                        // Contains RTP timestamp correlation info
-                        // TODO: update clock sync
+                    // Sync packet (PT 0x54 / 84 decimal)
+                    0x54 => {
+                        if let Some((rtp_minus_lat, rtp_now, remote_ntp, first)) =
+                            parse_sync_packet(&buf[..amt])
+                        {
+                            if let Ok(mut sync) = clock_sync.write() {
+                                sync.apply_sync_packet(rtp_minus_lat, rtp_now, remote_ntp, first);
+                            }
+                        } else {
+                            debug!(bytes = amt, "Failed to parse SYNC packet");
+                        }
                     }
                     _ => {
                         debug!(pt = payload_type, "Unknown control packet type");
@@ -316,6 +379,19 @@ mod tests {
         pkt[8..12].copy_from_slice(&0u32.to_be_bytes()); // SSRC
         pkt[12..].copy_from_slice(payload);
         pkt
+    }
+
+    #[test]
+    fn test_parse_sync_packet() {
+        let mut pkt = [0u8; 20];
+        pkt[0] = 0x90;
+        pkt[1] = 0x80 | 0x54;
+        pkt[4..8].copy_from_slice(&1000u32.to_be_bytes());
+        pkt[16..20].copy_from_slice(&5000u32.to_be_bytes());
+        let (minus, now, _, first) = parse_sync_packet(&pkt).unwrap();
+        assert_eq!(minus, 1000);
+        assert_eq!(now, 5000);
+        assert!(first);
     }
 
     #[test]
@@ -360,9 +436,10 @@ mod tests {
         jb.insert(parse_rtp_packet(&make_rtp(2, 200, &[2])).unwrap());
 
         // Should come out in order
-        assert_eq!(jb.pop().unwrap().sequence, 1);
-        assert_eq!(jb.pop().unwrap().sequence, 2);
-        assert_eq!(jb.pop().unwrap().sequence, 3);
+        jb.sync_expected_to_front();
+        assert_eq!(jb.pop_next().unwrap().sequence, 1);
+        assert_eq!(jb.pop_next().unwrap().sequence, 2);
+        assert_eq!(jb.pop_next().unwrap().sequence, 3);
     }
 
     #[test]
@@ -387,10 +464,11 @@ mod tests {
         jb.insert(parse_rtp_packet(&make_rtp(1, 400, &[])).unwrap());
 
         // Should come out in wrapping order: 65534, 65535, 0, 1
-        assert_eq!(jb.pop().unwrap().sequence, 65534);
-        assert_eq!(jb.pop().unwrap().sequence, 65535);
-        assert_eq!(jb.pop().unwrap().sequence, 0);
-        assert_eq!(jb.pop().unwrap().sequence, 1);
+        jb.sync_expected_to_front();
+        assert_eq!(jb.pop_next().unwrap().sequence, 65534);
+        assert_eq!(jb.pop_next().unwrap().sequence, 65535);
+        assert_eq!(jb.pop_next().unwrap().sequence, 0);
+        assert_eq!(jb.pop_next().unwrap().sequence, 1);
     }
 
     #[test]
@@ -400,10 +478,12 @@ mod tests {
         jb.insert(parse_rtp_packet(&make_rtp(1, 100, &[])).unwrap());
         jb.insert(parse_rtp_packet(&make_rtp(2, 200, &[])).unwrap());
         jb.insert(parse_rtp_packet(&make_rtp(3, 300, &[])).unwrap());
-        jb.insert(parse_rtp_packet(&make_rtp(4, 400, &[])).unwrap()); // should drop
+        jb.insert(parse_rtp_packet(&make_rtp(4, 400, &[])).unwrap()); // evicts seq 1
 
         assert_eq!(jb.len(), 3);
-        assert_eq!(jb.stats().1, 1); // 1 dropped
+        assert_eq!(jb.stats().1, 1); // 1 evicted
+        jb.sync_expected_to_front();
+        assert_eq!(jb.pop_next().unwrap().sequence, 2);
     }
 
     #[test]
@@ -417,11 +497,12 @@ mod tests {
 
     #[test]
     fn test_jitter_buffer_is_ready() {
-        let mut jb = JitterBuffer::new(8); // min_fill = 2
+        let mut jb = JitterBuffer::new(32);
+        let min = jb.min_fill();
         assert!(!jb.is_ready());
-        jb.insert(parse_rtp_packet(&make_rtp(1, 100, &[])).unwrap());
-        assert!(!jb.is_ready());
-        jb.insert(parse_rtp_packet(&make_rtp(2, 200, &[])).unwrap());
+        for seq in 1..=min as u16 {
+            jb.insert(parse_rtp_packet(&make_rtp(seq, 100 * seq as u32, &[])).unwrap());
+        }
         assert!(jb.is_ready());
     }
 
