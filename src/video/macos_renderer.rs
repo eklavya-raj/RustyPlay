@@ -12,13 +12,18 @@ use cocoa::base::{id, nil, YES, NO};
 use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString};
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_video_sys::*;
+use dispatch;
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+use std::thread;
 
 use super::{DecodedFrame, PixelFormat, VideoRenderer};
+
+// Global flag to ensure NSApplication event loop is started only once
+static START_EVENT_LOOP: Once = Once::new();
 
 /// macOS-specific video renderer
 ///
@@ -40,61 +45,110 @@ unsafe impl Send for MacOSRenderer {}
 impl VideoRenderer for MacOSRenderer {
     fn new(width: u32, height: u32) -> Result<Self> {
         unsafe {
-            // Initialize NSApplication (required for window creation)
-            let app = NSApplication::sharedApplication(nil);
-            app.setActivationPolicy_(NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular);
+            // NSWindow and AppKit operations MUST run on the main thread
+            // Use GCD to dispatch window creation to main thread synchronously
+            // We send raw pointers as usize to make them Send-safe
+            use std::sync::mpsc;
             
-            // Create NSWindow
-            let window = NSWindow::alloc(nil);
-            let frame = NSRect::new(
-                NSPoint::new(100.0, 100.0),
-                NSSize::new(width as f64, height as f64),
-            );
+            let (tx, rx) = mpsc::channel::<Result<(usize, usize)>>();
             
-            let style_mask = NSWindowStyleMask::NSTitledWindowMask
-                | NSWindowStyleMask::NSClosableWindowMask
-                | NSWindowStyleMask::NSResizableWindowMask;
+            // Capture width and height explicitly for the closure
+            let w = width;
+            let h = height;
             
-            let window = window.initWithContentRect_styleMask_backing_defer_(
-                frame,
-                style_mask,
-                NSBackingStoreType::NSBackingStoreBuffered,
-                NO,
-            );
+            // The closure will be executed on the main thread
+            // We send raw pointers as usize which are Send
+            dispatch::Queue::main().exec_async(move || {
+                unsafe {
+                    // Initialize NSApplication (required for window creation)
+                    let app = NSApplication::sharedApplication(nil);
+                    app.setActivationPolicy_(NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular);
+                    
+                    // Create NSWindow
+                    let window = NSWindow::alloc(nil);
+                    
+                    // Check if allocation succeeded
+                    if window == nil {
+                        tracing::error!("NSWindow::alloc() returned nil - window allocation failed");
+                        let _ = tx.send(Err(anyhow::anyhow!("Failed to allocate NSWindow")));
+                        return;
+                    }
+                    
+                    let frame = NSRect::new(
+                        NSPoint::new(100.0, 100.0),
+                        NSSize::new(w as f64, h as f64),
+                    );
+                    
+                    let style_mask = NSWindowStyleMask::NSTitledWindowMask
+                        | NSWindowStyleMask::NSClosableWindowMask
+                        | NSWindowStyleMask::NSResizableWindowMask;
+                    
+                    let window = window.initWithContentRect_styleMask_backing_defer_(
+                        frame,
+                        style_mask,
+                        NSBackingStoreType::NSBackingStoreBuffered,
+                        NO,
+                    );
+                    
+                    // Check if initialization succeeded
+                    if window == nil {
+                        tracing::error!("NSWindow initialization failed - initWithContentRect returned nil");
+                        let _ = tx.send(Err(anyhow::anyhow!("Failed to initialize NSWindow")));
+                        return;
+                    }
+                    
+                    // Set window title
+                    let title = NSString::alloc(nil).init_str("RustyPlay - AirPlay Mirroring");
+                    window.setTitle_(title);
+                    
+                    // Activate the application to bring window to foreground
+                    app.activateIgnoringOtherApps_(YES);
+                    
+                    // Make window visible and key
+                    window.makeKeyAndOrderFront_(nil);
+                    
+                    // Force window to display immediately
+                    let _: () = msg_send![window, display];
+                    
+                    tracing::info!("NSWindow created and made visible");
+                    
+                    // Create AVSampleBufferDisplayLayer
+                    let display_layer_class = class!(AVSampleBufferDisplayLayer);
+                    let display_layer: id = msg_send![display_layer_class, new];
+                    
+                    if display_layer == nil {
+                        tracing::error!("AVSampleBufferDisplayLayer creation failed");
+                        let _ = tx.send(Err(anyhow::anyhow!("Failed to create AVSampleBufferDisplayLayer")));
+                        return;
+                    }
+                    
+                    // Get the content view and its layer
+                    let content_view: id = window.contentView();
+                    let _: () = msg_send![content_view, setWantsLayer: YES];
+                    let view_layer: id = msg_send![content_view, layer];
+                    
+                    // Set display layer frame to match content view bounds
+                    let bounds: NSRect = msg_send![content_view, bounds];
+                    let _: () = msg_send![display_layer, setFrame: bounds];
+                    
+                    // Add display layer as sublayer
+                    let _: () = msg_send![view_layer, addSublayer: display_layer];
+                    
+                    // Configure display layer for video content
+                    let _: () = msg_send![display_layer, setVideoGravity: NSString::alloc(nil).init_str("AVLayerVideoGravityResizeAspect")];
+                    
+                    // Send the window and display_layer back as raw pointers (usize)
+                    let _ = tx.send(Ok((window as usize, display_layer as usize)));
+                }
+            });
             
-            if window == nil {
-                anyhow::bail!("Failed to create NSWindow");
-            }
+            // Wait for the window creation to complete on the main thread
+            let (window_ptr, display_layer_ptr) = rx.recv()
+                .map_err(|e| anyhow::anyhow!("Failed to receive window from main thread: {}", e))??;
             
-            // Set window title
-            let title = NSString::alloc(nil).init_str("RustyPlay - AirPlay Mirroring");
-            window.setTitle_(title);
-            
-            // Make window visible
-            window.makeKeyAndOrderFront_(nil);
-            
-            // Create AVSampleBufferDisplayLayer
-            let display_layer_class = class!(AVSampleBufferDisplayLayer);
-            let display_layer: id = msg_send![display_layer_class, new];
-            
-            if display_layer == nil {
-                anyhow::bail!("Failed to create AVSampleBufferDisplayLayer");
-            }
-            
-            // Get the content view and its layer
-            let content_view: id = window.contentView();
-            let _: () = msg_send![content_view, setWantsLayer: YES];
-            let view_layer: id = msg_send![content_view, layer];
-            
-            // Set display layer frame to match content view bounds
-            let bounds: NSRect = msg_send![content_view, bounds];
-            let _: () = msg_send![display_layer, setFrame: bounds];
-            
-            // Add display layer as sublayer
-            let _: () = msg_send![view_layer, addSublayer: display_layer];
-            
-            // Configure display layer for video content
-            let _: () = msg_send![display_layer, setVideoGravity: NSString::alloc(nil).init_str("AVLayerVideoGravityResizeAspect")];
+            // Convert back to id pointers
+            let window = window_ptr as id;
+            let display_layer = display_layer_ptr as id;
             
             // Create CVPixelBufferPool for efficient buffer allocation
             let pixel_buffer_pool = Self::create_pixel_buffer_pool(width, height)?;
@@ -104,7 +158,7 @@ impl VideoRenderer for MacOSRenderer {
             tracing::info!(
                 width = width,
                 height = height,
-                "MacOSRenderer initialized with NSWindow and AVSampleBufferDisplayLayer"
+                "MacOSRenderer initialized with NSWindow and AVSampleBufferDisplayLayer on main thread"
             );
             
             Ok(Self {
@@ -120,22 +174,74 @@ impl VideoRenderer for MacOSRenderer {
     
     fn display_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
         unsafe {
-            // Create CVPixelBuffer from decoded frame
-            let pixel_buffer = self.create_pixel_buffer_from_frame(frame)?;
+            // Copy frame data for dispatch (Vec<u8> is Send)
+            let frame_data = frame.data.clone();
+            let frame_width = frame.width;
+            let frame_height = frame.height;
+            let frame_format = frame.format;
+            let frame_ts = frame.timestamp;
             
-            // Create CMSampleBuffer to wrap the pixel buffer
-            let sample_buffer = self.create_sample_buffer(pixel_buffer, frame.timestamp)?;
-            
-            // Enqueue sample buffer to display layer
-            let _: () = msg_send![self.display_layer, enqueueSampleBuffer: sample_buffer];
-            
-            // Release resources
-            CFRelease(sample_buffer as CFTypeRef);
-            CVPixelBufferRelease(pixel_buffer);
-            
+            // Move ALL CoreMedia + CoreAnimation work to the main thread.
+            // This includes CVPixelBuffer creation, CMSampleBuffer, enqueue, and cleanup.
+            let display_layer_ptr = self.display_layer as usize;
+
+            use std::sync::mpsc;
+            let (tx, rx) = mpsc::channel();
+
+            dispatch::Queue::main().exec_async(move || {
+                unsafe {
+                    let display_layer = display_layer_ptr as id;
+                    
+                    // Build a temporary DecodedFrame on the main thread
+                    let main_frame = DecodedFrame {
+                        data: frame_data,
+                        width: frame_width,
+                        height: frame_height,
+                        format: frame_format,
+                        timestamp: frame_ts,
+                    };
+                    
+                    // Create CVPixelBuffer from decoded frame data
+                    let pixel_buffer = match create_pixel_buffer_from_frame_on_main(&main_frame) {
+                        Ok(buf) => buf,
+                        Err(e) => {
+                            tracing::warn!("Failed to create pixel buffer: {:?}", e);
+                            let _ = tx.send(());
+                            return;
+                        }
+                    };
+
+                    // Create CMSampleBuffer from the pixel buffer.
+                    let sample_buffer = match create_sample_buffer_on_main(pixel_buffer, frame_ts) {
+                        Ok(buf) => buf,
+                        Err(e) => {
+                            tracing::warn!("Failed to create sample buffer: {:?}", e);
+                            CVPixelBufferRelease(pixel_buffer);
+                            let _ = tx.send(());
+                            return;
+                        }
+                    };
+
+                    // Enqueue sample buffer to display layer on the main thread.
+                    let _: () = msg_send![display_layer, enqueueSampleBuffer: sample_buffer];
+                    
+                    // Force display to update immediately
+                    let _: () = msg_send![display_layer, display];
+
+                    // Release resources after enqueue.
+                    CFRelease(sample_buffer as CFTypeRef);
+                    CVPixelBufferRelease(pixel_buffer);
+                }
+                let _ = tx.send(());
+            });
+
+            // Wait for the main-thread operation to complete
+            rx.recv().ok();
+
             Ok(())
         }
     }
+
     
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         unsafe {
@@ -147,27 +253,47 @@ impl VideoRenderer for MacOSRenderer {
                 "Resizing video window"
             );
             
-            // Calculate aspect ratio from source dimensions
-            let aspect_ratio = width as f64 / height as f64;
+            // All AppKit/CoreAnimation operations MUST run on the main thread.
+            // We use exec_sync to block the calling (tokio) thread until the
+            // main thread completes the window/layer resize.
+            let window_ptr = self.window as usize;
+            let display_layer_ptr = self.display_layer as usize;
+            let w = width as f64;
+            let h = height as f64;
             
-            // Get current window frame to preserve position
-            let current_frame: NSRect = msg_send![self.window, frame];
+            use std::sync::mpsc;
+            let (tx, rx) = mpsc::channel();
             
-            // Create new frame with updated dimensions while preserving aspect ratio
-            let new_frame = NSRect::new(
-                current_frame.origin,
-                NSSize::new(width as f64, height as f64),
-            );
+            dispatch::Queue::main().exec_async(move || {
+                unsafe {
+                    let window = window_ptr as id;
+                    let display_layer = display_layer_ptr as id;
+                    
+                    // Get current window frame to preserve position
+                    let current_frame: NSRect = msg_send![window, frame];
+                    
+                    // Create new frame with updated dimensions
+                    let new_frame = NSRect::new(
+                        current_frame.origin,
+                        NSSize::new(w, h),
+                    );
+                    
+                    // Update window frame (no animation to avoid thread issues)
+                    let _: () = msg_send![window, setFrame:new_frame display:YES animate:NO];
+                    let _: () = msg_send![window, display];
+                    
+                    // Update display layer frame to match content view bounds
+                    let content_view: id = msg_send![window, contentView];
+                    let bounds: NSRect = msg_send![content_view, bounds];
+                    let _: () = msg_send![display_layer, setFrame: bounds];
+                }
+                let _ = tx.send(());
+            });
             
-            // Update window frame
-            let _: () = msg_send![self.window, setFrame:new_frame display:YES animate:YES];
+            // Wait for the main thread to finish the resize
+            rx.recv().ok();
             
-            // Update display layer frame to match content view bounds
-            let content_view: id = msg_send![self.window, contentView];
-            let bounds: NSRect = msg_send![content_view, bounds];
-            let _: () = msg_send![self.display_layer, setFrame: bounds];
-            
-            // Recreate CVPixelBufferPool with new dimensions
+            // Recreate CVPixelBufferPool with new dimensions (safe off main thread)
             if let Some(old_pool) = self.pixel_buffer_pool.take() {
                 CVPixelBufferPoolRelease(old_pool);
                 tracing::debug!("Released old CVPixelBufferPool");
@@ -183,8 +309,7 @@ impl VideoRenderer for MacOSRenderer {
             tracing::info!(
                 width = width,
                 height = height,
-                aspect_ratio = aspect_ratio,
-                "Window resized successfully"
+                "Window resized synchronously via main thread"
             );
             
             Ok(())
@@ -192,30 +317,38 @@ impl VideoRenderer for MacOSRenderer {
     }
     
     fn is_window_open(&self) -> bool {
-        unsafe {
-            // Check if window is still visible
-            let is_visible: bool = msg_send![self.window, isVisible];
-            is_visible && self.window_open.load(Ordering::Relaxed)
-        }
+        // Use atomic flag only to avoid calling AppKit from non-main threads
+        self.window_open.load(Ordering::Relaxed)
     }
     
     fn shutdown(&mut self) -> Result<()> {
         unsafe {
             tracing::info!("Shutting down MacOSRenderer");
             
-            // Release pixel buffer pool
+            // Release pixel buffer pool (safe off main thread)
             if let Some(pool) = self.pixel_buffer_pool.take() {
                 CVPixelBufferPoolRelease(pool);
             }
             
-            // Remove display layer from superlayer
-            let _: () = msg_send![self.display_layer, removeFromSuperlayer];
+            // AppKit operations must go through the main thread
+            let window_ptr = self.window as usize;
+            let display_layer_ptr = self.display_layer as usize;
             
-            // Release display layer
-            let _: () = msg_send![self.display_layer, release];
-            
-            // Close window
-            let _: () = msg_send![self.window, close];
+            dispatch::Queue::main().exec_async(move || {
+                unsafe {
+                    let window = window_ptr as id;
+                    let display_layer = display_layer_ptr as id;
+                    
+                    // Remove display layer from superlayer
+                    let _: () = msg_send![display_layer, removeFromSuperlayer];
+                    
+                    // Release display layer
+                    let _: () = msg_send![display_layer, release];
+                    
+                    // Close window
+                    let _: () = msg_send![window, close];
+                }
+            });
             
             self.window_open.store(false, Ordering::Relaxed);
         }
@@ -490,6 +623,179 @@ impl MacOSRenderer {
         
         Ok(sample_buffer)
     }
+}
+
+/// Create a CVPixelBuffer from a DecodedFrame (designed to run on main thread)
+unsafe fn create_pixel_buffer_from_frame_on_main(frame: &DecodedFrame) -> Result<CVPixelBufferRef> {
+    use core_foundation::base::kCFAllocatorDefault;
+    
+    let mut pixel_buffer: CVPixelBufferRef = ptr::null_mut();
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    
+    match frame.format {
+        PixelFormat::NV12 => {
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width, height,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                ptr::null(),
+                &mut pixel_buffer,
+            );
+            
+            if status != kCVReturnSuccess {
+                anyhow::bail!("Failed to create CVPixelBuffer: {}", status);
+            }
+            
+            CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+            
+            // Copy Y plane
+            let y_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0) as usize;
+            for row in 0..height {
+                let src_off = row * width;
+                let dst_off = row * y_stride;
+                ptr::copy_nonoverlapping(
+                    frame.data.as_ptr().add(src_off),
+                    (y_dest as *mut u8).add(dst_off),
+                    width,
+                );
+            }
+            
+            // Copy UV plane
+            let uv_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+            let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1) as usize;
+            let uv_height = height / 2;
+            let y_size = width * height;
+            for row in 0..uv_height {
+                let src_off = y_size + row * width;
+                let dst_off = row * uv_stride;
+                ptr::copy_nonoverlapping(
+                    frame.data.as_ptr().add(src_off),
+                    (uv_dest as *mut u8).add(dst_off),
+                    width,
+                );
+            }
+            
+            CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+        }
+        
+        PixelFormat::YUV420P => {
+            // Create NV12 pixel buffer (preferred by CoreVideo)
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width, height,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                ptr::null(),
+                &mut pixel_buffer,
+            );
+            
+            if status != kCVReturnSuccess {
+                anyhow::bail!("Failed to create CVPixelBuffer: {}", status);
+            }
+            
+            CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+            
+            // Copy Y plane (same for both formats)
+            let y_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0) as usize;
+            for row in 0..height {
+                let src_off = row * width;
+                let dst_off = row * y_stride;
+                ptr::copy_nonoverlapping(
+                    frame.data.as_ptr().add(src_off),
+                    (y_dest as *mut u8).add(dst_off),
+                    width,
+                );
+            }
+            
+            // YUV420P has separate U and V planes -> convert to interleaved NV12 UV plane
+            let uv_dest = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+            let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1) as usize;
+            let uv_height = height / 2;
+            let uv_width = width / 2;
+            let y_size = width * height;
+            let u_size = uv_width * uv_height;
+            
+            for row in 0..uv_height {
+                for col in 0..uv_width {
+                    let u_src = y_size + row * uv_width + col;
+                    let v_src = y_size + u_size + row * uv_width + col;
+                    let dst = row * uv_stride + col * 2;
+                    *((uv_dest as *mut u8).add(dst)) = frame.data[u_src];
+                    *((uv_dest as *mut u8).add(dst + 1)) = frame.data[v_src];
+                }
+            }
+            
+            CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+        }
+        
+        _ => {
+            anyhow::bail!("Unsupported pixel format: {:?}", frame.format);
+        }
+    }
+    
+    Ok(pixel_buffer)
+}
+
+/// Create a CMSampleBuffer to wrap a CVPixelBuffer (designed to run on main thread)
+unsafe fn create_sample_buffer_on_main(
+    pixel_buffer: CVPixelBufferRef,
+    timestamp: Option<i64>,
+) -> Result<*mut c_void> {
+    use core_foundation::base::kCFAllocatorDefault;
+    
+    #[repr(C)]
+    struct CMTime {
+        value: i64,
+        timescale: i32,
+        flags: u32,
+        epoch: i64,
+    }
+    
+    #[repr(C)]
+    struct CMSampleTimingInfo {
+        duration: CMTime,
+        presentation_time_stamp: CMTime,
+        decode_time_stamp: CMTime,
+    }
+    
+    let time_value = timestamp.unwrap_or(0);
+    let timescale = 1_000_000_000;
+    
+    let timing = CMSampleTimingInfo {
+        duration: CMTime { value: 0, timescale, flags: 1, epoch: 0 },
+        presentation_time_stamp: CMTime { value: time_value, timescale, flags: 1, epoch: 0 },
+        decode_time_stamp: CMTime { value: time_value, timescale, flags: 1, epoch: 0 },
+    };
+    
+    let mut format_description: *mut c_void = ptr::null_mut();
+    let status = CMVideoFormatDescriptionCreateForImageBuffer(
+        kCFAllocatorDefault,
+        pixel_buffer,
+        &mut format_description,
+    );
+    
+    if status != 0 {
+        anyhow::bail!("Failed to create CMVideoFormatDescription: {}", status);
+    }
+    
+    let mut sample_buffer: *mut c_void = ptr::null_mut();
+    let status = CMSampleBufferCreateReadyWithImageBuffer(
+        kCFAllocatorDefault,
+        pixel_buffer,
+        format_description,
+        &timing as *const _ as *const c_void,
+        &mut sample_buffer,
+    );
+    
+    CFRelease(format_description as CFTypeRef);
+    
+    if status != 0 {
+        anyhow::bail!("Failed to create CMSampleBuffer: {}", status);
+    }
+    
+    Ok(sample_buffer)
 }
 
 // External Core Media functions

@@ -32,7 +32,6 @@ struct Config {
     timing_port: u16,
     verbose: bool,
     force_sw_dec: bool,
-    videosink: Option<String>,
 }
 
 impl Default for Config {
@@ -45,7 +44,6 @@ impl Default for Config {
             timing_port: DEFAULT_TIMING_PORT,
             verbose: false,
             force_sw_dec: false,
-            videosink: None,
         }
     }
 }
@@ -112,12 +110,6 @@ fn parse_args() -> Config {
             "-avdec" | "--software-decoding" => {
                 config.force_sw_dec = true;
             }
-            "-vs" | "--video-sink" => {
-                if i + 1 < args.len() {
-                    config.videosink = Some(args[i + 1].clone());
-                    i += 1;
-                }
-            }
             "-h" | "--help" => {
                 println!("Usage: rusty-play [OPTIONS]");
                 println!();
@@ -129,9 +121,12 @@ fn parse_args() -> Config {
                 println!("      --control-port <PORT>   Set control port (default: 6001)");
                 println!("      --timing-port <PORT>    Set timing port (default: 6002)");
                 println!("  -v, --verbose               Enable logging");
-                println!("  -avdec, --software-decoding Force software h264 video decoding with libav decoder (avdec_h264)");
-                println!("  -vs, --video-sink <SINK>    Set custom video sink (e.g. osximagesink, autovideosink)");
+                println!("  -avdec, --software-decoding Force software H.264 decoding (default: hardware-accelerated via FFmpeg)");
                 println!("  -h, --help                  Print this help");
+                println!();
+                println!("Video Pipeline:");
+                println!("  Uses FFmpeg for H.264 decoding with hardware acceleration (VideoToolbox on macOS)");
+                println!("  Native macOS rendering via AVFoundation and Metal for low-latency display");
                 std::process::exit(0);
             }
             _ => {
@@ -146,16 +141,62 @@ fn parse_args() -> Config {
     config
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // On macOS, the main thread MUST run the Cocoa event loop (`[NSApp run]`) for
+    // GUI windows to draw and for GCD main-queue closures to execute. Therefore we
+    // run the Tokio runtime on a background thread and keep the main thread free to
+    // pump the AppKit run loop.
+    #[cfg(target_os = "macos")]
+    {
+        // Build the Tokio runtime and run all async work on a dedicated background thread.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+
+        std::thread::Builder::new()
+            .name("tokio-runtime".to_string())
+            .spawn(move || {
+                runtime.block_on(async {
+                    if let Err(e) = async_main().await {
+                        tracing::error!("async_main exited with error: {:?}", e);
+                    }
+                });
+            })?;
+
+        // Initialize NSApplication on the main thread and run the Cocoa event loop.
+        // This blocks forever, pumping GUI events and executing main-queue dispatches.
+        unsafe {
+            use cocoa::appkit::{NSApplication, NSApplicationActivationPolicy};
+            use cocoa::base::nil;
+            use objc::{msg_send, sel, sel_impl};
+
+            let app = NSApplication::sharedApplication(nil);
+            app.setActivationPolicy_(NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular);
+
+            // Run the AppKit event loop on the main thread (never returns).
+            let _: () = msg_send![app, run];
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async_main())
+    }
+}
+
+async fn async_main() -> Result<()> {
     let config = parse_args();
+
 
     if config.force_sw_dec {
         mirror::FORCE_SOFTWARE_DECODER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(ref sink) = config.videosink {
-        *mirror::CUSTOM_VIDEOSINK.lock().unwrap() = Some(sink.clone());
-    }
+    // Note: videosink option is no longer used with native video pipeline
 
     let level_filter = if config.verbose {
         tracing_subscriber::filter::LevelFilter::INFO

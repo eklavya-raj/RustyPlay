@@ -731,8 +731,8 @@ async fn handle_rtsp_request(request_bytes: &[u8], state: &Arc<RtspState>, peer:
                                             // Hash the key with ECDH secret (matching uxplay behavior)
                                             if let Ok(secret_guard) = state.ecdh_secret.lock() {
                                                 if let Some(ecdh_secret) = *secret_guard {
-                                                    use sha2::{Sha256, Digest};
-                                                    let mut hasher = Sha256::new();
+                                                    use sha2::{Sha512, Digest};
+                                                    let mut hasher = Sha512::new();
                                                     hasher.update(&key_out);           // Original AES key (16 bytes)
                                                     hasher.update(&ecdh_secret);       // ECDH secret (32 bytes)
                                                     let hash_result = hasher.finalize();
@@ -749,8 +749,8 @@ async fn handle_rtsp_request(request_bytes: &[u8], state: &Arc<RtspState>, peer:
                                                     // Try hashing with the eiv as a fallback (some clients do this)
                                                     if let Some(ref eiv_data) = eiv_bytes {
                                                         if eiv_data.len() >= 16 {
-                                                            use sha2::{Sha256, Digest};
-                                                            let mut hasher = Sha256::new();
+                                                            use sha2::{Sha512, Digest};
+                                                            let mut hasher = Sha512::new();
                                                             hasher.update(&key_out);
                                                             hasher.update(&eiv_data[..16]);
                                                             let hash_result = hasher.finalize();

@@ -128,9 +128,15 @@ pub mod ffmpeg_decoder;
 #[cfg(target_os = "macos")]
 pub mod macos_renderer;
 
+// Video pipeline coordinator
+pub mod pipeline;
+
 // Re-export FFmpeg decoder
 pub use ffmpeg_decoder::FFmpegDecoder;
 
 // Re-export platform-specific renderer
 #[cfg(target_os = "macos")]
 pub use macos_renderer::MacOSRenderer;
+
+// Re-export video pipeline
+pub use pipeline::VideoPipeline;

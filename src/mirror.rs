@@ -4,10 +4,9 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 use aes::cipher::{BlockEncrypt, KeyInit};
-use std::process::{Command, Stdio, Child};
-use std::io::Write;
 
 use crate::codec::SessionInfo;
+use crate::video::pipeline::VideoPipeline;
 
 type Aes128 = aes::Aes128;
 
@@ -113,33 +112,9 @@ pub async fn start_mirroring_server(port: u16, session_info: Arc<RwLock<Option<S
     }
 }
 
-/// Helper function to spawn a low-latency GStreamer pipeline process.
-fn spawn_gstreamer() -> Option<Child> {
-    info!("Spawning GStreamer low-latency video window (gst-launch-1.0)...");
-    let child = Command::new("gst-launch-1.0")
-        .args(&[
-            "fdsrc", "fd=0",
-            "!", "h264parse",
-            "!", "decodebin",
-            "!", "videoconvert",
-            "!", "autovideosink", "sync=false",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+use std::sync::atomic::{AtomicBool, Ordering};
 
-    match child {
-        Ok(c) => {
-            info!("GStreamer window spawned successfully");
-            Some(c)
-        }
-        Err(e) => {
-            warn!("Failed to spawn GStreamer process (gst-launch-1.0). Is it installed? Error: {:?}", e);
-            None
-        }
-    }
-}
+pub static FORCE_SOFTWARE_DECODER: AtomicBool = AtomicBool::new(false);
 
 /// Handle a single mirroring TCP stream session.
 async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLock<Option<SessionInfo>>>) -> Result<()> {
@@ -179,20 +154,8 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
         }
     };
 
-    struct GstreamerGuard {
-        child: Option<Child>,
-    }
-
-    impl Drop for GstreamerGuard {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                info!("Stopping GStreamer low-latency video window...");
-                let _ = child.kill();
-            }
-        }
-    }
-
-    let mut guard = GstreamerGuard { child: None };
+    // Initialize video pipeline (lazy initialization on first video frame or codec config)
+    let mut video_pipeline: Option<VideoPipeline> = None;
 
     let mut header = [0u8; 128];
     loop {
@@ -233,6 +196,12 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                         break;
                     }
 
+                    // Validate forbidden_zero_bit (must be 0) of H.264 NAL header
+                    if (payload[offset + 4] & 0x80) != 0 {
+                        is_valid = false;
+                        break;
+                    }
+
                     // Convert to Annex-B start code
                     payload[offset..offset+4].copy_from_slice(&[0, 0, 0, 1]);
 
@@ -260,19 +229,20 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                         "Received video frame (decrypted & Annex-B formatted)"
                     );
 
-                    // Lazy-init GStreamer low-latency display window on first decrypted video frame
-                    if guard.child.is_none() {
-                        guard.child = spawn_gstreamer();
-                    }
-
-                    if let Some(ref mut child) = guard.child {
-                        if let Some(ref mut stdin) = child.stdin {
-                            if let Err(e) = stdin.write_all(&payload) {
-                                warn!("Failed to write video payload to GStreamer: {:?}", e);
-                            } else {
-                                let _ = stdin.flush();
+                    // Process frame through VideoPipeline (only if already initialized)
+                    // Note: VideoPipeline should be initialized by a valid codec config (type 0x01) first
+                    if let Some(ref mut pipeline) = video_pipeline {
+                        if let Err(e) = pipeline.process_nal_unit(&payload) {
+                            warn!("Failed to process video frame: {:?}", e);
+                            // If window was closed, break the loop
+                            if !pipeline.is_window_open() {
+                                info!("Video window closed by user, ending session");
+                                break;
                             }
                         }
+                    } else {
+                        // VideoPipeline not initialized yet - waiting for valid codec config
+                        debug!("Skipping video frame - waiting for valid codec configuration");
                     }
                 } else {
                     warn!(
@@ -296,44 +266,105 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
                     width = width,
                     height = height,
                     payload_size = payload_size,
+                    first_bytes = ?&payload[..std::cmp::min(16, payload_size)],
                     "Received video codec config / resolution change"
                 );
 
                 if payload_size > 0 {
-                    // Convert AVCC length prefixes to Annex-B start codes ([0, 0, 0, 1]) for SPS/PPS
-                    let mut offset = 0;
-                    let mut is_valid = true;
-                    while offset < payload_size {
-                        if offset + 4 > payload_size {
-                            is_valid = false;
-                            break;
+                    // Parse avcC (AVCC extradata) format and convert to Annex-B
+                    // avcC format: [version, profile, compat, level, lengthSize, numSPS, spsLen, sps, numPPS, ppsLen, pps]
+                    
+                    if payload_size >= 7 && payload[0] == 1 {
+                        // This is avcC format
+                        info!("Parsing avcC format codec config");
+                        
+                        let mut annexb_data = Vec::new();
+                        let mut offset = 5; // Skip version, profile, compat, level, lengthSize
+                        
+                        // Parse SPS
+                        let num_sps = (payload[offset] & 0x1F) as usize;
+                        offset += 1;
+                        
+                        for _ in 0..num_sps {
+                            if offset + 2 > payload_size {
+                                warn!("Invalid avcC: insufficient data for SPS length");
+                                break;
+                            }
+                            let sps_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                            offset += 2;
+                            
+                            if offset + sps_len > payload_size {
+                                warn!("Invalid avcC: SPS length exceeds payload");
+                                break;
+                            }
+                            
+                            // Add Annex-B start code
+                            annexb_data.extend_from_slice(&[0, 0, 0, 1]);
+                            // Add SPS data
+                            annexb_data.extend_from_slice(&payload[offset..offset + sps_len]);
+                            offset += sps_len;
                         }
-                        let nalu_len = u32::from_be_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
-                        if offset + 4 + nalu_len > payload_size {
-                            is_valid = false;
-                            break;
-                        }
-                        payload[offset..offset+4].copy_from_slice(&[0, 0, 0, 1]);
-                        offset += 4 + nalu_len;
-                    }
-
-                    if is_valid {
-                        // Lazy-init GStreamer low-latency display window on codec configuration
-                        if guard.child.is_none() {
-                            guard.child = spawn_gstreamer();
-                        }
-
-                        if let Some(ref mut child) = guard.child {
-                            if let Some(ref mut stdin) = child.stdin {
-                                if let Err(e) = stdin.write_all(&payload) {
-                                    warn!("Failed to write SPS/PPS headers to GStreamer: {:?}", e);
-                                } else {
-                                    let _ = stdin.flush();
+                        
+                        // Parse PPS
+                        if offset < payload_size {
+                            let num_pps = payload[offset] as usize;
+                            offset += 1;
+                            
+                            for _ in 0..num_pps {
+                                if offset + 2 > payload_size {
+                                    warn!("Invalid avcC: insufficient data for PPS length");
+                                    break;
                                 }
+                                let pps_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                                offset += 2;
+                                
+                                if offset + pps_len > payload_size {
+                                    warn!("Invalid avcC: PPS length exceeds payload");
+                                    break;
+                                }
+                                
+                                // Add Annex-B start code
+                                annexb_data.extend_from_slice(&[0, 0, 0, 1]);
+                                // Add PPS data
+                                annexb_data.extend_from_slice(&payload[offset..offset + pps_len]);
+                                offset += pps_len;
                             }
                         }
+                        
+                        if !annexb_data.is_empty() {
+                            info!(
+                                annexb_size = annexb_data.len(),
+                                "Converted avcC to Annex-B format"
+                            );
+                            payload = annexb_data;
+                        } else {
+                            warn!("Failed to parse avcC format");
+                        }
+                    }
+                    
+                    // Now payload should be in Annex-B format
+                    // Lazy-init or reconfigure VideoPipeline with codec configuration
+                    if let Some(ref mut pipeline) = video_pipeline {
+                        // Pipeline already exists, reconfigure it
+                        if let Err(e) = pipeline.process_codec_config(&payload, width, height) {
+                            warn!("Failed to process codec config: {:?}", e);
+                        }
                     } else {
-                        warn!("Received malformed SPS/PPS configuration packet");
+                        // Initialize pipeline with codec config
+                        let use_hardware = !FORCE_SOFTWARE_DECODER.load(Ordering::Relaxed);
+                        match VideoPipeline::new(use_hardware) {
+                            Ok(mut pipeline) => {
+                                if let Err(e) = pipeline.process_codec_config(&payload, width, height) {
+                                    warn!("Failed to process initial codec config: {:?}", e);
+                                } else {
+                                    info!("VideoPipeline initialized with codec config");
+                                    video_pipeline = Some(pipeline);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to initialize VideoPipeline: {:?}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -364,6 +395,17 @@ async fn handle_client(mut stream: tokio::net::TcpStream, session_info: Arc<RwLo
             }
         }
     }
+
+    // Cleanup: shutdown video pipeline if it was initialized
+    if let Some(mut pipeline) = video_pipeline {
+        if let Err(e) = pipeline.shutdown() {
+            warn!("Error shutting down video pipeline: {:?}", e);
+        } else {
+            info!("Video pipeline shut down successfully");
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

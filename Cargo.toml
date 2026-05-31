@@ -3,6 +3,14 @@ name = "rusty-play"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rusty_play"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rusty-play"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
 hyper = { version = "1.4", features = ["full"] }
@@ -38,6 +46,7 @@ core-foundation = "0.10"
 metal = "0.29"
 core-video-sys = "0.1"
 objc = "0.2"
+dispatch = "0.2"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 libmdns = "0.8"
