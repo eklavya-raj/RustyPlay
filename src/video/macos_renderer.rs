@@ -21,9 +21,10 @@ use std::sync::{Arc, Once};
 use core_foundation::base::kCFAllocatorDefault;
 
 use super::{DEFAULT_MIRROR_FPS, VIDEO_PTS_TIMESCALE};
-use std::thread;
 
 use super::{DecodedFrame, PixelFormat, VideoRenderer};
+
+
 
 // Global flag to ensure NSApplication event loop is started only once
 static START_EVENT_LOOP: Once = Once::new();
@@ -45,6 +46,7 @@ pub struct MacOSRenderer {
     display_fps: u32,
     in_flight: Arc<AtomicUsize>,
     timebase_started: Arc<AtomicBool>,
+    resize_in_progress: Arc<AtomicBool>,
 }
 
 // Safety: NSWindow and AVSampleBufferDisplayLayer are thread-safe for our use case
@@ -140,11 +142,16 @@ impl VideoRenderer for MacOSRenderer {
                     let bounds: NSRect = msg_send![content_view, bounds];
                     let _: () = msg_send![display_layer, setFrame: bounds];
                     
+                    // Set autoresizing mask so layer resizes with view
+                    let _: () = msg_send![display_layer, setAutoresizingMask: 31]; // 31 = all edges flexible
+                    
                     // Add display layer as sublayer
                     let _: () = msg_send![view_layer, addSublayer: display_layer];
                     
                     // Configure display layer for video content
+                    // Use ResizeAspect to maintain aspect ratio without cropping (allows letterboxing)
                     let _: () = msg_send![display_layer, setVideoGravity: NSString::alloc(nil).init_str("AVLayerVideoGravityResizeAspect")];
+                    tracing::debug!("Display layer gravity set to ResizeAspect");
 
                     // Send the window and display_layer back as raw pointers (usize)
                     let _ = tx.send(Ok((window as usize, display_layer as usize)));
@@ -180,6 +187,7 @@ impl VideoRenderer for MacOSRenderer {
                 display_fps: DEFAULT_MIRROR_FPS,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 timebase_started: Arc::new(AtomicBool::new(false)),
+                resize_in_progress: Arc::new(AtomicBool::new(false)),
             })
         }
     }
@@ -190,6 +198,12 @@ impl VideoRenderer for MacOSRenderer {
     }
 
     fn display_frame(&mut self, frame: DecodedFrame) -> Result<()> {
+        // Skip frame enqueueing during resize to avoid dimension mismatches
+        if self.resize_in_progress.load(Ordering::Acquire) {
+            tracing::debug!("Skipping frame display during resize operation");
+            return Ok(());
+        }
+
         if self.in_flight.load(Ordering::Acquire) >= MAX_DISPLAY_IN_FLIGHT {
             tracing::trace!("Dropping video frame — main-thread backlog");
             return Ok(());
@@ -232,6 +246,9 @@ impl VideoRenderer for MacOSRenderer {
 
     
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        // Set flag to pause frame enqueueing during resize
+        self.resize_in_progress.store(true, Ordering::Release);
+
         unsafe {
             tracing::info!(
                 old_width = self.width,
@@ -257,6 +274,12 @@ impl VideoRenderer for MacOSRenderer {
                     let window = window_ptr as id;
                     let display_layer = display_layer_ptr as id;
                     
+                    // CRITICAL: Flush the display layer to clear any buffered frames
+                    // that may have dimensions mismatched with the new resolution.
+                    // This prevents video from getting stuck during orientation changes.
+                    let _: () = msg_send![display_layer, flushAndRemoveImage];
+                    tracing::debug!("Flushed AVSampleBufferDisplayLayer");
+                    
                     // Get current window frame to preserve position
                     let current_frame: NSRect = msg_send![window, frame];
                     
@@ -274,6 +297,14 @@ impl VideoRenderer for MacOSRenderer {
                     let content_view: id = msg_send![window, contentView];
                     let bounds: NSRect = msg_send![content_view, bounds];
                     let _: () = msg_send![display_layer, setFrame: bounds];
+                    
+                    tracing::info!(
+                        layer_x = bounds.origin.x,
+                        layer_y = bounds.origin.y,
+                        layer_width = bounds.size.width,
+                        layer_height = bounds.size.height,
+                        "Updated display layer frame during resize"
+                    );
                 }
                 let _ = tx.send(());
             });
@@ -299,9 +330,12 @@ impl VideoRenderer for MacOSRenderer {
                 height = height,
                 "Window resized synchronously via main thread"
             );
-            
-            Ok(())
         }
+
+        // Clear flag to resume frame enqueueing after resize
+        self.resize_in_progress.store(false, Ordering::Release);
+
+        Ok(())
     }
     
     fn is_window_open(&self) -> bool {

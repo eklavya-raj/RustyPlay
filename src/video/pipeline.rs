@@ -39,13 +39,19 @@ impl VideoPipeline {
         let decoder = FFmpegDecoder::new(use_hardware_decoding)?;
         tracing::info!("FFmpegDecoder initialized successfully");
 
+        // Use default dimensions - will be updated when first video frame arrives with actual device dimensions
+        const DEFAULT_WIDTH: u32 = 1920;
+        const DEFAULT_HEIGHT: u32 = 1080;
+        
         #[cfg(target_os = "macos")]
-        let mut renderer: Box<dyn VideoRenderer> = Box::new(MacOSRenderer::new(1920, 1080)?);
+        let mut renderer: Box<dyn VideoRenderer> = Box::new(MacOSRenderer::new(DEFAULT_WIDTH, DEFAULT_HEIGHT)?);
         renderer.set_display_fps(DEFAULT_MIRROR_FPS);
         #[cfg(target_os = "macos")]
         tracing::info!(
             display_fps = DEFAULT_MIRROR_FPS,
-            "MacOSRenderer created successfully"
+            window_width = DEFAULT_WIDTH,
+            window_height = DEFAULT_HEIGHT,
+            "MacOSRenderer created successfully with default dimensions"
         );
 
         #[cfg(not(target_os = "macos"))]
@@ -56,8 +62,8 @@ impl VideoPipeline {
         Ok(Self {
             decoder,
             renderer,
-            current_width: 1920,
-            current_height: 1080,
+            current_width: DEFAULT_WIDTH,
+            current_height: DEFAULT_HEIGHT,
             frame_count: 0,
             last_frame_time: None,
             last_pts_ns: -1,

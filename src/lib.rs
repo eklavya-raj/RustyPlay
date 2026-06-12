@@ -106,11 +106,19 @@ impl AirPlayServer {
                 ecdh_secret: ecdh_secret.clone(),
             });
 
+            // Sender address for retransmit requests
+            let sender_addr: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> = Arc::new(std::sync::Mutex::new(None));
+
             // Spawn servers
             handles.push(tokio::spawn(http::start_http_server(config.http_port, http_state)));
             handles.push(tokio::spawn(rtsp::start_rtsp_server(config.rtsp_port, rtsp_state)));
             handles.push(tokio::spawn(rtp::start_rtp_receiver(config.rtp_port, jitter_buffer.clone())));
-            handles.push(tokio::spawn(rtp::start_rtp_control(config.control_port, clock_sync.clone())));
+            handles.push(tokio::spawn(rtp::start_rtp_control(
+                config.control_port,
+                clock_sync.clone(),
+                jitter_buffer.clone(),
+                sender_addr.clone(),
+            )));
             handles.push(tokio::spawn(ntp::start_timing_server(config.timing_port, clock_sync.clone(), client_timing_addr.clone())));
             handles.push(tokio::spawn(audio::run_audio_pipeline(
                 jitter_buffer,

@@ -75,7 +75,8 @@ impl JitterBuffer {
 
         // Fast path: most packets arrive in order (O(1) vs O(log n) binary search).
         if let Some(back) = self.buffer.back() {
-            if packet.sequence == back.sequence {
+            // Improved duplicate detection: check both timestamp and sequence
+            if packet.sequence == back.sequence && packet.timestamp == back.timestamp {
                 self.total_duplicates += 1;
                 return;
             }
@@ -90,7 +91,15 @@ impl JitterBuffer {
 
         let pos = self.buffer.binary_search_by(|p| seq_compare(p.sequence, packet.sequence));
         match pos {
-            Ok(_) => self.total_duplicates += 1,
+            Ok(idx) => {
+                // Check if it's a true duplicate (same timestamp and sequence)
+                if self.buffer[idx].timestamp == packet.timestamp {
+                    self.total_duplicates += 1;
+                } else {
+                    // Different timestamp, same sequence (rare but possible) - insert anyway
+                    self.buffer.insert(idx + 1, packet);
+                }
+            }
             Err(idx) => self.buffer.insert(idx, packet),
         }
     }
@@ -105,6 +114,28 @@ impl JitterBuffer {
     /// RTP timestamp of the next packet to play (if any).
     pub fn front_rtp_timestamp(&self) -> Option<u32> {
         self.buffer.front().map(|p| p.timestamp)
+    }
+
+    /// Check if there's a gap at the front of the buffer.
+    /// Returns Some((expected_seq, front_seq, gap_size)) if there's a gap and buffer is not backing up.
+    /// Returns None if no gap or buffer is too full to wait.
+    pub fn check_gap(&self) -> Option<(u16, u16, u16)> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        let expected = self.expected_seq?;
+        let front_seq = self.buffer.front()?.sequence;
+        
+        if front_seq != expected {
+            // Only request retransmit if buffer is not backing up
+            if self.buffer.len() < self.max_size / 2 {
+                // Calculate gap size (handle wrap-around)
+                let gap_size = front_seq.wrapping_sub(expected);
+                return Some((expected, front_seq, gap_size));
+            }
+        }
+        None
     }
 
     /// Pop the next in-order packet (uxplay-style), waiting on gaps when possible.
@@ -307,10 +338,89 @@ fn parse_sync_packet(data: &[u8]) -> Option<(u32, u32, NtpTimestamp, bool)> {
     Some((rtp_now_minus_latency, rtp_now, remote_ntp, first_after_flush))
 }
 
+/// Build a retransmit request packet (PT 85) for missing RTP sequence numbers.
+///
+/// Format: RTP-like header with PT=85, followed by:
+///   - seq_start (2 bytes, big-endian u16): first missing sequence
+///   - count (2 bytes, big-endian u16): number of packets to retransmit
+fn build_retransmit_request(seq_start: u16, count: u16) -> Vec<u8> {
+    let mut pkt = vec![0u8; 8];
+    pkt[0] = 0x80; // V=2, P=0, X=0, CC=0
+    pkt[1] = 0x80 | 85; // M=1, PT=85
+    pkt[2..4].copy_from_slice(&seq_start.to_be_bytes());
+    pkt[4..6].copy_from_slice(&count.to_be_bytes());
+    pkt
+}
+
+/// Start a retransmit request handler that monitors jitter buffer gaps.
+///
+/// This spawns a background task that periodically checks the jitter buffer for gaps
+/// and sends retransmit requests when needed.
+pub async fn start_retransmit_handler(
+    control_port: u16,
+    jitter_buffer: Arc<Mutex<JitterBuffer>>,
+    sender_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+) -> Result<()> {
+    let socket = UdpSocket::bind(":::0").await?; // Bind to any available port
+    info!("Retransmit request handler started");
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Check for gaps
+        let gap_info = {
+            let buffer = jitter_buffer.lock().unwrap();
+            buffer.check_gap()
+        };
+
+        if let Some((expected, _front, gap_size)) = gap_info {
+            // Only request reasonable gap sizes (avoid requesting too many on major loss)
+            if gap_size > 0 && gap_size < 10 {
+                if let Some(addr) = *sender_addr.lock().unwrap() {
+                    let request = build_retransmit_request(expected, gap_size);
+                    if let Err(e) = socket.send_to(&request, addr).await {
+                        debug!("Failed to send retransmit request: {}", e);
+                    } else {
+                        debug!(
+                            seq_start = expected,
+                            count = gap_size,
+                            "Sent retransmit request"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse a retransmit response packet (PT 86) to extract the embedded RTP packet.
+///
+/// Format: RTP-like header with PT=86, followed by the original RTP packet
+fn parse_retransmit_response(data: &[u8]) -> Option<RtpPacket> {
+    if data.len() < 4 {
+        return None;
+    }
+    let pt = data[1] & 0x7F;
+    if pt != 86 {
+        return None;
+    }
+    // The embedded RTP packet starts after the 4-byte header
+    if data.len() > 4 {
+        parse_rtp_packet(&data[4..])
+    } else {
+        None
+    }
+}
+
 /// Handles RTCP-like control packets (retransmission requests, sync, etc.)
-pub async fn start_rtp_control(port: u16, clock_sync: Arc<RwLock<ClockSync>>) -> Result<()> {
+pub async fn start_rtp_control(
+    port: u16,
+    clock_sync: Arc<RwLock<ClockSync>>,
+    jitter_buffer: Arc<Mutex<JitterBuffer>>,
+    sender_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+) -> Result<()> {
     let addr = format!("[::]:{}", port);
-    let socket = UdpSocket::bind(&addr).await?;
+    let socket = Arc::new(UdpSocket::bind(&addr).await?);
     info!(port = port, "RTP control receiver started");
 
     let mut buf = [0u8; 2048];
@@ -318,6 +428,14 @@ pub async fn start_rtp_control(port: u16, clock_sync: Arc<RwLock<ClockSync>>) ->
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((amt, src)) => {
+                // Update sender address for retransmit requests
+                {
+                    let mut addr_guard = sender_addr.lock().unwrap();
+                    if addr_guard.is_none() {
+                        *addr_guard = Some(src);
+                    }
+                }
+
                 if amt < 4 {
                     continue;
                 }
@@ -338,8 +456,18 @@ pub async fn start_rtp_control(port: u16, clock_sync: Arc<RwLock<ClockSync>>) ->
                     // Retransmit response (type 86)
                     86 => {
                         // Client is resending a packet we requested
-                        debug!("Retransmit response from client");
-                        // TODO: extract the embedded RTP packet and insert into jitter buffer
+                        if let Some(packet) = parse_retransmit_response(&buf[..amt]) {
+                            debug!(
+                                seq = packet.sequence,
+                                ts = packet.timestamp,
+                                "Retransmit response received, inserting into jitter buffer"
+                            );
+                            // Insert into jitter buffer (duplicate check will handle if already received)
+                            let mut buffer = jitter_buffer.lock().unwrap();
+                            buffer.insert(packet);
+                        } else {
+                            debug!(bytes = amt, "Failed to parse retransmit response");
+                        }
                     }
                     // Sync packet (PT 0x54 / 84 decimal)
                     0x54 => {
@@ -508,6 +636,118 @@ mod tests {
 
     #[test]
     fn test_seq_compare() {
+        use std::cmp::Ordering;
+        assert_eq!(seq_compare(1, 2), Ordering::Less);
+        assert_eq!(seq_compare(2, 1), Ordering::Greater);
+        assert_eq!(seq_compare(5, 5), Ordering::Equal);
+        // Wrap-around: 65535 < 0 (65535 is "before" 0)
+        assert_eq!(seq_compare(65535, 0), Ordering::Less);
+        assert_eq!(seq_compare(0, 65535), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_improved_duplicate_detection() {
+        let mut jb = JitterBuffer::new(10);
+
+        // Insert packet with seq=1, ts=100
+        jb.insert(parse_rtp_packet(&make_rtp(1, 100, &[1])).unwrap());
+        
+        // Insert duplicate with same seq and ts - should be detected
+        jb.insert(parse_rtp_packet(&make_rtp(1, 100, &[1])).unwrap());
+        assert_eq!(jb.len(), 1);
+        assert_eq!(jb.stats().2, 1); // 1 duplicate detected
+
+        // Insert packet with same seq but different ts - should NOT be duplicate
+        jb.insert(parse_rtp_packet(&make_rtp(1, 200, &[2])).unwrap());
+        assert_eq!(jb.len(), 2); // Both packets kept
+        assert_eq!(jb.stats().2, 1); // Still only 1 duplicate
+    }
+
+    #[test]
+    fn test_timestamp_sequence_duplicate_detection() {
+        let mut jb = JitterBuffer::new(10);
+
+        // Scenario: sender retransmits with same timestamp but different sequence
+        jb.insert(parse_rtp_packet(&make_rtp(100, 1000, &[1])).unwrap());
+        jb.insert(parse_rtp_packet(&make_rtp(101, 1000, &[2])).unwrap());
+        
+        // Both should be kept since they have different sequences
+        assert_eq!(jb.len(), 2);
+    }
+
+    #[test]
+    fn test_build_retransmit_request() {
+        let req = build_retransmit_request(100, 5);
+        assert_eq!(req.len(), 8);
+        assert_eq!(req[0], 0x80); // V=2
+        assert_eq!(req[1], 0x80 | 85); // M=1, PT=85
+        
+        let seq_start = u16::from_be_bytes([req[2], req[3]]);
+        let count = u16::from_be_bytes([req[4], req[5]]);
+        assert_eq!(seq_start, 100);
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_parse_retransmit_response() {
+        // Build a retransmit response with embedded RTP packet
+        let embedded_rtp = make_rtp(42, 1000, &[0xAA, 0xBB]);
+        let mut response = vec![0u8; 4 + embedded_rtp.len()];
+        response[0] = 0x80; // V=2
+        response[1] = 0x80 | 86; // M=1, PT=86
+        response[4..].copy_from_slice(&embedded_rtp);
+        
+        let parsed = parse_retransmit_response(&response).unwrap();
+        assert_eq!(parsed.sequence, 42);
+        assert_eq!(parsed.timestamp, 1000);
+        assert_eq!(parsed.payload, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_jitter_buffer_check_gap() {
+        let mut jb = JitterBuffer::new(10);
+        
+        // No gap when empty
+        assert!(jb.check_gap().is_none());
+        
+        // Insert packets with a gap: seq 100, 102, 103 (missing 101)
+        jb.insert(parse_rtp_packet(&make_rtp(100, 1000, &[])).unwrap());
+        jb.insert(parse_rtp_packet(&make_rtp(102, 1200, &[])).unwrap());
+        jb.insert(parse_rtp_packet(&make_rtp(103, 1300, &[])).unwrap());
+        
+        jb.sync_expected_to_front(); // Set expected to 100
+        jb.pop_next(); // Pop 100, now expected is 101
+        
+        // Should detect gap: expected 101, front is 102
+        let gap = jb.check_gap();
+        assert!(gap.is_some());
+        let (expected, front, gap_size) = gap.unwrap();
+        assert_eq!(expected, 101);
+        assert_eq!(front, 102);
+        assert_eq!(gap_size, 1);
+    }
+
+    #[test]
+    fn test_jitter_buffer_no_gap_when_full() {
+        let mut jb = JitterBuffer::new(10);
+        
+        // Fill buffer to more than half capacity
+        for i in 100..107 {
+            jb.insert(parse_rtp_packet(&make_rtp(i, i as u32 * 100, &[])).unwrap());
+        }
+        
+        jb.sync_expected_to_front();
+        jb.pop_next(); // Pop 100
+        
+        // Insert packet creating a gap but buffer is > max_size/2
+        jb.insert(parse_rtp_packet(&make_rtp(110, 11000, &[])).unwrap());
+        
+        // Should not report gap because buffer is too full
+        assert!(jb.check_gap().is_none());
+    }
+
+    #[test]
+    fn test_seq_compare_duplicate() {
         use std::cmp::Ordering;
         assert_eq!(seq_compare(1, 2), Ordering::Less);
         assert_eq!(seq_compare(2, 1), Ordering::Greater);

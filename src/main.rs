@@ -273,9 +273,16 @@ async fn async_main() -> Result<()> {
         tracing::error!("Neither HTTP nor RTSP server could start - skipping mDNS registration");
     }
 
+    // Sender address for retransmit requests
+    let sender_addr: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+
     let mut rtp_handle = tokio::spawn(rtp::start_rtp_receiver(config.rtp_port, jitter_buffer.clone()));
-    let mut control_handle =
-        tokio::spawn(rtp::start_rtp_control(config.control_port, clock_sync.clone()));
+    let mut control_handle = tokio::spawn(rtp::start_rtp_control(
+        config.control_port,
+        clock_sync.clone(),
+        jitter_buffer.clone(),
+        sender_addr.clone(),
+    ));
     let mut timing_handle = tokio::spawn(ntp::start_timing_server(config.timing_port, clock_sync.clone(), client_timing_addr.clone()));
     let mut audio_handle = tokio::spawn(audio::run_audio_pipeline(
         jitter_buffer,
